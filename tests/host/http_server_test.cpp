@@ -203,6 +203,27 @@ struct ServerHandle {
 
 const char* kGetHello = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n";
 
+DGPP_TEST(http_silent_sse_emits_comment_heartbeat_without_data_event) {
+  ServerHandle sh;
+  Client stream(sh.port());
+  stream.send_all("GET /tagged HTTP/1.1\r\nHost: t\r\n\r\n");
+  const std::string head = stream.read_available(100);
+  require(head.find("text/event-stream") != std::string::npos, "SSE headers");
+  require(head.find("data:") == std::string::npos, "silent stream has no model event");
+  std::this_thread::sleep_for(std::chrono::milliseconds(15100));
+  const std::string heartbeat = stream.read_available(100);
+  require(heartbeat == "e\r\n: keep-alive\n\n\r\n", "one correctly chunked SSE comment");
+  require(heartbeat.find("data:") == std::string::npos, "heartbeat is not a model event");
+  Client other(sh.port());
+  other.send_all(kGetHello);
+  require(other.read_available(100).find("{\"ok\":true}") != std::string::npos,
+          "silent stream does not block other requests");
+  stream.hard_close();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  require(sh.handler.disconnects == 1 && sh.handler.last_tag == 42,
+          "heartbeat stream retains the normal cancellation hook");
+}
+
 DGPP_TEST(http_default_bind_does_not_accept_other_loopback_addresses) {
   ServerHandle sh;
   const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
