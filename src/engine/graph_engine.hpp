@@ -466,9 +466,10 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       DGPP_CUDA_OK(cudaMemset(d_stage_seq_, 0, sizeof(uint64_t) * n));
       stage_seq_.assign(n, 0);
     }
-    batch_min_live_ = slots_ == 1
-                          ? 1
-                          : std::clamp(batch_min_live, 1, slots_);
+    // slots_ + 1 deliberately never crosses over: retain independent scalar
+    // decode graphs as requests join/retire, without reducing admission slots.
+    // This controls decode shape, not prefill/cache numerical equivalence.
+    batch_min_live_ = std::clamp(batch_min_live, 1, slots_ + 1);
     if (batch_unavailable_) {
       // Never reached by the live count: every step replays a scalar graph.
       batch_min_live_ = slots_ + 1;
@@ -484,10 +485,13 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
             "graph",
             rank_, slots_, slots_ == 1 ? "" : "s", rows_per_request_,
             max_rows_);
+    } else if (batch_min_live_ == slots_ + 1) {
+      DGPP_LOG_INFO("rank {}: graph batching disabled by crossover {}; {} request slots use scalar graphs",
+                    rank_, batch_min_live_, slots_);
     } else if (batch_min_live_ != batch_min_live)
       DGPP_LOG_INFO(
           "rank {}: graph batch crossover {} clamped to {} — the fixed batch "
-          "has {} slot{}, so the batch is selected only at full occupancy",
+          "has {} slot{}",
           rank_, batch_min_live, batch_min_live_, slots_,
           slots_ == 1 ? "" : "s");
   }

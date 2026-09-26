@@ -1152,7 +1152,7 @@ int main(int argc, char** argv) {
       "    [--rendezvous-timeout-ms N (120000)]\n"
       "    [--decode-graph [--mtp | --no-mtp]]\n"
       "    [--graph-batch-min-live N (default min(2, max-concurrency);\n"
-      "      must be in [1, max-concurrency])]\n"
+      "      1..max-concurrency batches; max-concurrency+1 keeps scalar graphs)]\n"
       "      (the row batch needs max-concurrency * (1 + mtp depth) <= 8)\n"
       "    [--mtp-depth N]  draft tokens per step (1..5; the verify runs 1+N rows)\n"
       "    [--mtp-schedule]  the confidence-scheduled verify depth (DeepSeek-V4.1's\n"
@@ -1762,9 +1762,9 @@ int main(int argc, char** argv) {
     // crossover moves from four to two.
     graph_batch_min_live = std::min(2, max_concurrency);
   } else if (graph_batch_min_live < 1 ||
-             graph_batch_min_live > max_concurrency) {
+             graph_batch_min_live > max_concurrency + 1) {
     DGPP_LOG_ERROR(
-        "--graph-batch-min-live must be in [1, --max-concurrency] (got {} "
+        "--graph-batch-min-live must be in [1, --max-concurrency + 1] (got {} "
         "with {} slot(s))",
         graph_batch_min_live, max_concurrency);
     return 1;

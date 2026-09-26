@@ -483,6 +483,92 @@ DGPP_TEST(qwen_engines_world_of_one_four_slots_compact_fp8_head) {
   }
 }
 
+DGPP_TEST(qwen_engines_world_of_one_scalar_crossover_retire_and_reuse) {
+  struct RestoreModes {
+    bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
+    bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();
+    ~RestoreModes() {
+      dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
+      dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
+    }
+  } restore;
+  const auto cfg = qwenfx::tiny_config();
+  const std::string dir = "qwen_engine_scalar_crossover_fixture";
+  qwenfx::write_fixture(cfg, dir);
+  std::vector<std::vector<int64_t>> prompts;
+  for (int i = 0; i < 5; ++i)
+    prompts.push_back(smoke_tokens(cfg, 17 + i * 3, 0xCA00 + i));
+  dgpp::QwenLayerStream::set_ngram_table_mmap(true);
+  for (bool fp8 : {false, true}) for (bool mtp : {false, true}) {
+    dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
+    auto buses = start_world(1, kPort + 22);
+    require(buses.size() == 1, "scalar crossover world-of-one bus");
+    QwenModel model(cfg, dir, 128, 1024, QwenResidency::Resident, nullptr, 0, 1, 4,
+                    mtp, 8, false, true);
+    uint16_t* scratch = nullptr;
+    DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
+                               sizeof(uint16_t) * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
+    {
+      GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
+          cfg.vocab_size, wait_timeout_ms(), 5, nullptr, nullptr, 0, nullptr, 0, 1, false);
+      require(graph.batch_min_live() == 5, "explicit scalar crossover must not be clamped to slot count");
+      const std::array<size_t, 5> lengths{9, 33, 17, 25, 17};
+      std::vector<std::vector<int32_t>> expected(5), actual(5);
+      // Establish each transcript in isolation, using the same MTP setting.
+      for (int i = 0; i < 5; ++i) {
+        expected[i].push_back(graph.prefill(0, prompts[i]));
+        graph.reserve(0, prompts[i].size() + 48);
+        while (expected[i].size() < lengths[i]) {
+          auto t = graph.step(0);
+          expected[i].insert(expected[i].end(), t.begin(), t.end());
+        }
+        expected[i].resize(lengths[i]);
+        graph.close(0);
+      }
+      std::array<int, 4> jobs{0, 1, 2, 3};
+      for (int slot = 0; slot < 4; ++slot) {
+        actual[slot].push_back(graph.prefill(slot, prompts[slot]));
+        graph.reserve(slot, prompts[slot].size() + 48);
+      }
+      std::vector<int> active{0, 1, 2, 3};
+      while (!active.empty()) {
+        const auto before = graph.decode_batch_stats();
+        const auto tokens = graph.step_batch(active);
+        const auto after = graph.decode_batch_stats();
+        require(after.replays_by_slots[1] - before.replays_by_slots[1] == active.size(),
+                "every active request must replay its own scalar graph");
+        require(after.padded_rows == before.padded_rows, "scalar requests must have no padded batch rows");
+        std::vector<int> remaining;
+        bool refill = false;
+        for (size_t j = 0; j < active.size(); ++j) {
+          const int slot = active[j], job = jobs[slot];
+          actual[job].insert(actual[job].end(), tokens[j].begin(), tokens[j].end());
+          if (actual[job].size() >= lengths[job]) {
+            actual[job].resize(lengths[job]);
+            require(actual[job] == expected[job], "scalar transcript changes with occupancy/slot reuse");
+            graph.close(slot);
+            if (job == 0) refill = true;
+          } else {
+            remaining.push_back(slot);
+          }
+        }
+        // Reuse slot zero while slot one and the other survivors still decode.
+        if (refill) {
+          jobs[0] = 4;
+          actual[4].push_back(graph.prefill(0, prompts[4]));
+          graph.reserve(0, prompts[4].size() + 48);
+          remaining.push_back(0);
+        }
+        active = std::move(remaining);
+      }
+      graph.drain();
+      for (size_t f = 0; f < graph.batch_families().size(); ++f)
+        require(graph.batch_family_steps(static_cast<int>(f)) == 0, "row batch must never replay");
+    }
+    cudaFreeHost(scratch);
+  }
+}
+
 DGPP_TEST(qwen_engines_loopback_world_2_mtp_graph_matches_plain_decode) {
   const QwenTextConfig cfg = qwenfx::tiny_config();
   const std::string dir = "qwen_engine_fixture";
