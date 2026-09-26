@@ -35,13 +35,14 @@ the tested `d44bebb612051a9581803479e6ec456c2e5c62ae`:
 documentation and a deployment example. Rebuilding a new commit changes the
 reported version; this does not retag or replace the already validated binary.
 
-Release `spark-2026.09.26.2` incorporates upstream PR #54 and serves as
+Previous release `spark-2026.09.26.2` incorporates upstream PR #54 and was served as
 `0.1.0+gf5739da0db70`. It keeps the initial engine settings and checkpoint history
 defaults. See [the integration record](benchmarks/results/2026-09-26-spark-upstream-history.md)
 for native checks, live request comparisons, the template-name correction and
 the new history-control checks.
 
-The next accuracy profile and its limitations are recorded in
+The deployed accuracy release `spark-2026.09.26.3`, source `9ab9b2cfda94`,
+serves as `0.1.0+g9ab9b2cfda94`. Its validation and limitations are recorded in
 [the accuracy result](benchmarks/results/2026-09-26-spark-accuracy.md). It restores
 checkpoint dense weights and uses separate request execution. Fixed-history
 concurrency checks improved, but the complete TC-63 scenario still reproduced a

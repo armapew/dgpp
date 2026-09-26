@@ -65,7 +65,10 @@ One early comparison included unrelated traffic and was discarded. The clean
 repeats checked request-counter deltas. Native checks covered 27 host CTest
 groups, single-node MTP/eager agreement, four slots, and explicit scalar-mode
 retirement/reuse with MTP on/off and checkpoint/FP8 dense weights. The final
-release gate rebuilds the merged tree and reruns host and scalar GPU checks.
+merged release tree passed all 27 host groups again (212.63 seconds) and the
+scalar GPU check with default math dispatch. The installed release then passed
+LAN discovery, xhigh generation, four-live-slot scalar execution, raw/escaped
+Unicode and nonzero Prometheus MTP counters checked against JSON metrics.
 Multi-node/RoCE behavior is not validated by this single-node experiment.
 
 ## Capacity and performance
@@ -99,3 +102,14 @@ These are single measurements across fixed workloads, not a statistical full
 benchmark. Raw requests, responses, counters, invalid comparisons, memory
 samples and rollback artifacts are retained in the separate Spark operations
 workspace under `experiments/accuracy-upgrade-2026-09-26/`.
+
+## Release identity
+
+Source `9ab9b2cfda9433a1d88d05e92b27f18a47b418a0` is tagged
+`spark-2026.09.26.3` and deployed as `0.1.0+g9ab9b2cfda94`. The source branches
+were published, the package was installed and the normal launcher selected its
+release pin. The actual executable and hashes were verified at 20:18 UTC on
+2026-09-26. The service was healthy and idle; the temporary monitor and all
+diagnostics had stopped. The previous release and full matching configuration
+remain intact for rollback. Subsequent documentation commits do not change the
+tagged executable.
