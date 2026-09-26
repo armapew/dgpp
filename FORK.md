@@ -53,7 +53,7 @@ admission and the NVIDIA checkpoint's existing expert format.
 
 ## Deployment profile
 
-Use [the Spark profile](deploy/cluster_spark_qwen-3.8-flash-next_nvfp4_w1.example.json)
+Use [the Spark profile](deploy/cluster_qwen-3.8-flash-next_nvfp4_w1_spark.example.json)
 as a template. It records four slots, 850048 BF16 KV tokens, MTP depth 2,
 4096/1024 idle/busy prefill tokens, 3 GiB prefix snapshots and full admission.
 The per-request model context ceiling is 262144 tokens including output.

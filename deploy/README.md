@@ -2,10 +2,9 @@
 
 One template per model, quantization and world size:
 `cluster_<model>_<quant>_w<n>.example.json`. An optional trailing
-`_<variant>` names a template that deviates from that shape in one documented
-engine setting rather than in its size — today
-`cluster_qwen-3.8-flash-next_nvfp4_w2_yarn512k.example.json`, the same two-Spark
-NVFP4 deployment with the YaRN rope ramp switched on. Base shapes stay unique;
+`_<variant>` names a template with documented engine settings for the same
+model, quantization and world size. Examples are the two-Spark `yarn512k` rope
+ramp and this fork's measured single-node `spark` profile. Base shapes stay unique;
 a variant may repeat a base only with that suffix. Local copies use the same name
 without `.example` and stay Git-ignored; the launcher fills the nodes, the SSH
 user and the ports from the site's `.env` (`scripts/site_env.py`).
@@ -32,6 +31,7 @@ a template does not name are knobs appended at boot:
 
 | Template | Deployment | The shapes it replaced, as knobs |
 |---|---|---|
+| [cluster_qwen-3.8-flash-next_nvfp4_w1_spark.example.json](cluster_qwen-3.8-flash-next_nvfp4_w1_spark.example.json) | Spark fork profile: NVIDIA Qwen NVFP4 on one node, four slots, 850048 shared BF16 KV tokens, MTP depth 2, 4096/1024 idle/busy prefill tokens and 3 GiB prefix snapshots | See [fork settings and validation](../FORK.md); per-request context remains 262144 including output |
 | [cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json](cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json) | GLM-5.3-Flash hybrid on four nodes: MTP depth 1, bf16 latent cache, 768K context, an 8 GiB prefix arena, four request slots | the 8K-context template: `--kv-capacity 8192 --prefix-cache-gib 1.5`; T=1: `--no-mtp` |
 | [cluster_glm-5.3-flash_nvfp4-fp8_w2.example.json](cluster_glm-5.3-flash_nvfp4-fp8_w2.example.json) | the same hybrid on two nodes: MTP depth 1, FP8 latent cache, 160K context, four request slots; the BF16 decode weights resident in their 12-bit form alone (`"bf12"`: 107.0 GiB per rank, 1 GiB under the BF16 plan, 4.8 GiB of the node left at boot) | both forms resident (no prefill cost, 132K context): `--bf16-weights bf12+bf16 --kv-capacity 135168`; the 256K-context two-slot shape: `--max-concurrency 2 --kv-capacity 262144 --prefix-cache-gib 2` |
 | [cluster_qwen-3.8-flash-next_fp8_w4.example.json](cluster_qwen-3.8-flash-next_fp8_w4.example.json) | Qwen3.8-Flash-Next FP8 on four nodes: MTP depth 1, 256K context, four request slots | T=1: `--no-mtp`; depth 2: `--mtp-depth 2` |
