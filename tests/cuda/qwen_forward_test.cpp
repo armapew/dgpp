@@ -206,6 +206,9 @@ int run_plan_check() {  // The memory plan's context line under the rope knob (e
                                  false, 8)
                   .context_tokens == want_on,
           "a pool at the ceiling");
+  require(dgpp::QwenQsaLayer::scratch_bytes(cfg, 4, 2, 4096, 128) -
+              dgpp::QwenQsaLayer::scratch_bytes(cfg, 4, 2, 4096, 64) == size_t{256 * 64 * 8},
+          "long prefill scoring workspace is capped at 256 rows");
   std::printf("[ OK ] qwen_plan_check\n");
   return 0;
 }
