@@ -33,16 +33,13 @@ void launch_swiglu_quantize_rows_nvfp4(const uint16_t* gate, const uint16_t* up,
 // act(row) the quantized row act_rows[seg.row0 + m] (or seg.row0 + m when
 // act_rows is null). Same segment/view/out conventions as
 // launch_moe_grouped_mma_fp4_{bf16,f32}; k % 64 == 0.
-// routed_rows > 0 opts into a compact job grid: segments must be ordered,
-// non-overlapping contiguous row ranges, ending at/before routed_rows.
-// Zero keeps the general rectangular grid; no extra device storage is needed.
 void launch_moe_grouped_w4a4_bf16(const uint8_t* codes, const uint8_t* scales, const float* gs,
                                   const int32_t* act_rows, const MoeSegment* segs, int n_segs, int max_rows,
                                   const MoeExpertView* views, int which, uint16_t* out, size_t out_stride, int n,
-                                  int k, cudaStream_t stream, int routed_rows = 0);
+                                  int k, cudaStream_t stream);
 void launch_moe_grouped_w4a4_f32(const uint8_t* codes, const uint8_t* scales, const float* gs,
                                  const int32_t* act_rows, const MoeSegment* segs, int n_segs, int max_rows,
                                  const MoeExpertView* views, int which, float* out, size_t out_stride, int n, int k,
-                                 cudaStream_t stream, int routed_rows = 0);
+                                 cudaStream_t stream);
 
 }  // namespace dgpp

@@ -211,42 +211,18 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
     const uint8_t* __restrict__ a_codes, size_t a_code_stride, const uint8_t* __restrict__ a_scales,
     size_t a_scale_stride, const float* __restrict__ a_gs, const int32_t* __restrict__ act_rows,
     const MoeSegment* __restrict__ segs, const MoeExpertView* __restrict__ views, int which,
-    OutT* __restrict__ out, size_t out_stride, int n, int k, int m_tiles, int n_segs, int row_jobs) {
+    OutT* __restrict__ out, size_t out_stride, int n, int k, int m_tiles) {
   using namespace w4a4;
   using TL = Tile<kBM>;
   constexpr size_t kACodesT = TL::a_codes, kAScalesT = TL::a_scales, kSlotT = TL::slot;
   extern __shared__ __align__(16) uint8_t smem[];
-  int segment = static_cast<int>(blockIdx.y);
-  int m_tile = static_cast<int>(blockIdx.x) % m_tiles;
-  int n_group = static_cast<int>(blockIdx.x) / m_tiles;
-  if (row_jobs > 0) {
-    const int job = static_cast<int>(blockIdx.x);
-    const int groups = ((n + BN - 1) / BN + kNT - 1) / kNT;
-    // start(i) = floor(row0(i)/BM) + i is strictly increasing, including
-    // empty experts. Its interval holds ceil(rows(i)/BM) tiles plus at
-    // most one empty tile. Thus floor(total_rows/BM)+n_segs jobs cover
-    // every tile without a prefix-sum workspace or a host readback.
-    int lo = 0, hi = n_segs;
-    while (lo + 1 < hi) {
-      const int mid = lo + (hi - lo) / 2;
-      if ((segs[mid].row0 / kBM + mid) * groups <= job) lo = mid;
-      else hi = mid;
-    }
-    segment = lo;
-    const int start = segs[segment].row0 / kBM + segment;
-    const int end = segment + 1 < n_segs ? segs[segment + 1].row0 / kBM + segment + 1 : row_jobs;
-    const int local = job - start * groups;
-    if (local < 0) return;
-    // Preserve expert -> output-column -> row-tile order for weight and
-    // activation locality, while keeping every populated tile parallel.
-    m_tile = local % (end - start);
-    n_group = local / (end - start);
-  }
-  const MoeSegment seg = segs[segment];
+  const MoeSegment seg = segs[blockIdx.y];
+  const int m_tile = static_cast<int>(blockIdx.x) % m_tiles;
   // kNT consecutive n-tiles per CTA: one cp.async ring runs across
   // the tiles, so a short-k GEMM (the down projection, k = 320: 2.5 stages a
   // tile) pays its pipeline prologue once per CTA, and each tile's epilogue
   // stores overlap the next tile's loads. kNT = 1 is the original kernel.
+  const int n_group = static_cast<int>(blockIdx.x) / m_tiles;
   const int n_tiles_total = (n + BN - 1) / BN;
   const int t0 = n_group * kNT;
   const int tiles_here = min(kNT, n_tiles_total - t0);
@@ -265,8 +241,8 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
   const int stages = (k + BK - 1) / BK;
 
   // Per-thread copy assignments (fixed across stages).
-  // A codes: ceil(kBM / 64) passes; BM32 masks the unused copy threads.
-  constexpr int kAPasses = (kBM + 63) / 64;
+  // A codes: kBM / 64 passes of (row tid/4 + 64 p, 16-byte chunk tid%4).
+  constexpr int kAPasses = kBM / 64;
   const int a_chunk = tid & 3;
   int a_row[kAPasses];
   bool a_ok[kAPasses];
@@ -309,8 +285,7 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
     for (int p = 0; p < kAPasses; ++p) {
       const int gb = kb0 + a_chunk * 16;
       const int in = a_ok[p] ? max(0, min(16, k / 2 - gb)) : 0;
-      if (a_row[p] < kBM)
-        cp_async(base + a_row[p] * kRowBytes + a_chunk * 16, in > 0 ? a_code_src[p] + gb : a_codes, 16, in);
+      cp_async(base + a_row[p] * kRowBytes + a_chunk * 16, in > 0 ? a_code_src[p] + gb : a_codes, 16, in);
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -468,7 +443,7 @@ void launch_swiglu_quantize_rows_nvfp4(const uint16_t* gate, const uint16_t* up,
 template <typename OutT>
 static void launch_w4a4(const uint8_t* codes, const uint8_t* scales, const float* gs, const int32_t* act_rows,
                         const MoeSegment* segs, int n_segs, int max_rows, const MoeExpertView* views, int which,
-                        OutT* out, size_t out_stride, int n, int k, cudaStream_t stream, int routed_rows) {
+                        OutT* out, size_t out_stride, int n, int k, cudaStream_t stream) {
   using namespace w4a4;
   if (n_segs <= 0 || n <= 0) return;
   if (k % 64 != 0) throw std::invalid_argument("moe w4a4: k must be a multiple of 64");
@@ -480,16 +455,13 @@ static void launch_w4a4(const uint8_t* codes, const uint8_t* scales, const float
     const char* e = std::getenv("DGPP_W4A4_STAGES");
     return e != nullptr && std::atoi(e) == 3 ? 3 : 2;
   }();
-  // DGPP_W4A4_BM=32|64|128 (default 128; idle GPU, moe_w4a4_test at 8,192
+  // DGPP_W4A4_BM=64|128 (default 128; idle GPU, moe_w4a4_test at 8,192
   // tokens x top-10: gate/up 3.40 -> 3.27 ms, down 5.27 -> 4.89 ms).
   static const int bm = [] {
     const char* e = std::getenv("DGPP_W4A4_BM");
-    const int value = e != nullptr ? std::atoi(e) : 128;
-    return value == 32 || value == 64 ? value : 128;
+    return e != nullptr && std::atoi(e) == 64 ? 64 : 128;
   }();
   static const bool opted = [] {  // once per process and OutT, thread-safe
-    DGPP_CUDA_OK(cudaFuncSetAttribute(moe_grouped_w4a4_kernel<OutT, 2, 32>,
-                                      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes_bm<2, 32>())));
     DGPP_CUDA_OK(cudaFuncSetAttribute(moe_grouped_w4a4_kernel<OutT, 2, 64>,
                                       cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes_bm<2, 64>())));
     DGPP_CUDA_OK(cudaFuncSetAttribute(moe_grouped_w4a4_kernel<OutT, 3, 64>,
@@ -499,17 +471,7 @@ static void launch_w4a4(const uint8_t* codes, const uint8_t* scales, const float
     return true;
   }();
   (void)opted;
-  if (routed_rows < 0) throw std::invalid_argument("moe w4a4: routed_rows");
-  static const bool compact_grid = [] {
-    const char* e = std::getenv("DGPP_W4A4_COMPACT_GRID");
-    return e == nullptr || e[0] != '0';
-  }();
-  const int row_jobs = compact_grid && routed_rows > 0 ? routed_rows / bm + n_segs : 0;
   const int m_tiles = (max_rows + bm - 1) / bm;
-  const auto grid_for = [&](unsigned groups) {
-    return row_jobs > 0 ? dim3(groups * static_cast<unsigned>(row_jobs), 1u, 1u)
-                        : dim3(groups * static_cast<unsigned>(m_tiles), static_cast<unsigned>(n_segs), 1u);
-  };
   const unsigned n_tiles = static_cast<unsigned>((n + BN - 1) / BN);
   const size_t cs = static_cast<size_t>(k) / 2, ss = nvfp4_act_scale_stride(k);
   // n-tiles per CTA (DGPP_W4A4_NT=1|2|4; measured neutral, default 1).
@@ -530,45 +492,42 @@ static void launch_w4a4(const uint8_t* codes, const uint8_t* scales, const float
     }();
     (void)opted_nt;
     const unsigned groups = (n_tiles + nt_env - 1) / nt_env;
-    const dim3 g2 = grid_for(groups);
+    const dim3 g2(groups * static_cast<unsigned>(m_tiles), static_cast<unsigned>(n_segs), 1u);
     if (nt_env == 2)
       moe_grouped_w4a4_kernel<OutT, 2, 128, 2><<<g2, kThreads, smem_bytes_bm<2, 128>(), stream>>>(
-          codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles, n_segs, row_jobs);
+          codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles);
     else
       moe_grouped_w4a4_kernel<OutT, 2, 128, 4><<<g2, kThreads, smem_bytes_bm<2, 128>(), stream>>>(
-          codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles, n_segs, row_jobs);
+          codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles);
     DGPP_CUDA_OK(cudaGetLastError());
     return;
   }
-  const dim3 grid = grid_for(n_tiles);
+  const dim3 grid(n_tiles * static_cast<unsigned>(m_tiles), static_cast<unsigned>(n_segs), 1u);
   if (bm == 128)
     moe_grouped_w4a4_kernel<OutT, 2, 128><<<grid, kThreads, smem_bytes_bm<2, 128>(), stream>>>(
-        codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles, n_segs, row_jobs);
-  else if (bm == 32)
-    moe_grouped_w4a4_kernel<OutT, 2, 32><<<grid, kThreads, smem_bytes_bm<2, 32>(), stream>>>(
-        codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles, n_segs, row_jobs);
+        codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles);
   else if (stages == 3)
     moe_grouped_w4a4_kernel<OutT, 3, 64><<<grid, kThreads, smem_bytes_bm<3, 64>(), stream>>>(
-        codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles, n_segs, row_jobs);
+        codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles);
   else
     moe_grouped_w4a4_kernel<OutT, 2, 64><<<grid, kThreads, smem_bytes_bm<2, 64>(), stream>>>(
-        codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles, n_segs, row_jobs);
+        codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
 void launch_moe_grouped_w4a4_bf16(const uint8_t* codes, const uint8_t* scales, const float* gs,
                                   const int32_t* act_rows, const MoeSegment* segs, int n_segs, int max_rows,
                                   const MoeExpertView* views, int which, uint16_t* out, size_t out_stride, int n,
-                                  int k, cudaStream_t stream, int routed_rows) {
+                                  int k, cudaStream_t stream) {
   launch_w4a4<uint16_t>(codes, scales, gs, act_rows, segs, n_segs, max_rows, views, which, out, out_stride, n, k,
-                        stream, routed_rows);
+                        stream);
 }
 void launch_moe_grouped_w4a4_f32(const uint8_t* codes, const uint8_t* scales, const float* gs,
                                  const int32_t* act_rows, const MoeSegment* segs, int n_segs, int max_rows,
                                  const MoeExpertView* views, int which, float* out, size_t out_stride, int n, int k,
-                                 cudaStream_t stream, int routed_rows) {
+                                 cudaStream_t stream) {
   launch_w4a4<float>(codes, scales, gs, act_rows, segs, n_segs, max_rows, views, which, out, out_stride, n, k,
-                     stream, routed_rows);
+                     stream);
 }
 
 }  // namespace dgpp
