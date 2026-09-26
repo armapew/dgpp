@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,7 @@ namespace {
 constexpr int kEpollTimeoutMs = 25;   // the idle() cadence
 constexpr size_t kMaxHeaderBytes = 16 * 1024;
 constexpr size_t kReadChunk = 16 * 1024;
+constexpr auto kStreamHeartbeat = std::chrono::seconds(15);
 
 bool set_nonblock(int fd) {
   const int flags = fcntl(fd, F_GETFL, 0);
@@ -105,6 +107,7 @@ struct Conn {
   std::string in;            // buffered input
   std::string out;           // pending output
   size_t flushed = 0;        // out bytes already sent
+  std::chrono::steady_clock::time_point last_stream_output{};
   HttpResponseWriter writer; // stable for the conn's lifetime; handlers
                              // may hold it across idle() passes
 
@@ -138,6 +141,7 @@ void HttpResponseWriter::begin_stream(std::string_view content_type) {
   if (conn_ == nullptr || conn_->fd < 0) return;
   Conn& c = *conn_;
   c.stream = true;
+  c.last_stream_output = std::chrono::steady_clock::now();
   char head[256];
   const int n = std::snprintf(
       head, sizeof(head),
@@ -157,6 +161,7 @@ bool HttpResponseWriter::write_event(std::string_view data) {
   frame.reserve(data.size() + 8);
   frame.append("data: ").append(data).append("\n\n", 2);
   c.out.append(chunk_frame(frame));
+  c.last_stream_output = std::chrono::steady_clock::now();
   return true;
 }
 
@@ -285,6 +290,16 @@ void HttpServer::serve() {
         (void)process_requests(*c);
     }
     for (auto& [fd, c] : conns_) {
+      // Long prefills and queued requests can be silent for minutes. SSE
+      // comments keep the HTTP stream active without creating a data event.
+      // Do not accumulate heartbeats behind a blocked socket's pending data.
+      if (c->fd >= 0 && c->stream && !c->closing && c->out.empty()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - c->last_stream_output >= kStreamHeartbeat) {
+          c->out.append(chunk_frame(": keep-alive\n\n"));
+          c->last_stream_output = now;
+        }
+      }
       if (c->fd >= 0 && !c->out.empty()) {
         flush_out(*c);
         if (c->fd >= 0 && c->closing && c->flushed >= c->out.size())
