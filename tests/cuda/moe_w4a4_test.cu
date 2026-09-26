@@ -299,6 +299,7 @@ int main(int argc, char** argv) {
   // k = 2560; down n = 2560, k = 320).
   fails += run(tokens, experts, topk, 640, 2560, false, "gate_up");
   fails += run(tokens, experts, topk, 2560, 320, false, "down");
+  fails += run(tokens, experts, topk, 2560, 640, false, "down-world1");
   // The fused activation + quantizer against swiglu -> quantize, bitwise
   // (codes, scales, globals), at the Qwen down projection's k = 320.
   {
