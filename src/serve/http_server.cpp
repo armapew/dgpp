@@ -1,21 +1,20 @@
 #include "serve/http_server.hpp"
 
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <algorithm>
+#include <arpa/inet.h>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdexcept>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <utility>
 
 #include "common/log.hpp"
@@ -28,7 +27,6 @@ namespace {
 constexpr int kEpollTimeoutMs = 25;   // the idle() cadence
 constexpr size_t kMaxHeaderBytes = 16 * 1024;
 constexpr size_t kReadChunk = 16 * 1024;
-constexpr auto kStreamHeartbeat = std::chrono::seconds(15);
 
 bool set_nonblock(int fd) {
   const int flags = fcntl(fd, F_GETFL, 0);
@@ -94,6 +92,7 @@ const std::string* HttpRequest::header(std::string_view name) const {
 // ---------------------------------------------------------------------------
 
 struct Conn {
+  std::chrono::steady_clock::time_point last_stream_write;
   int fd = -1;
   bool keep_alive = true;
   bool stream = false;       // chunked SSE mode
@@ -107,7 +106,6 @@ struct Conn {
   std::string in;            // buffered input
   std::string out;           // pending output
   size_t flushed = 0;        // out bytes already sent
-  std::chrono::steady_clock::time_point last_stream_output{};
   HttpResponseWriter writer; // stable for the conn's lifetime; handlers
                              // may hold it across idle() passes
 
@@ -141,7 +139,7 @@ void HttpResponseWriter::begin_stream(std::string_view content_type) {
   if (conn_ == nullptr || conn_->fd < 0) return;
   Conn& c = *conn_;
   c.stream = true;
-  c.last_stream_output = std::chrono::steady_clock::now();
+  c.last_stream_write = std::chrono::steady_clock::now();
   char head[256];
   const int n = std::snprintf(
       head, sizeof(head),
@@ -161,8 +159,30 @@ bool HttpResponseWriter::write_event(std::string_view data) {
   frame.reserve(data.size() + 8);
   frame.append("data: ").append(data).append("\n\n", 2);
   c.out.append(chunk_frame(frame));
-  c.last_stream_output = std::chrono::steady_clock::now();
+  c.last_stream_write = std::chrono::steady_clock::now();
   return true;
+}
+
+bool HttpResponseWriter::write_comment(std::string_view comment) {
+  if (conn_ == nullptr || conn_->fd < 0 || conn_->gone || conn_->closing || !conn_->stream)
+    return false;
+  if (comment.find_first_of("\r\n") != std::string_view::npos)
+    throw std::invalid_argument("http: SSE comment must be a single line");
+  Conn& c = *conn_;
+  std::string frame;
+  frame.reserve(comment.size() + 4);
+  frame.append(": ").append(comment).append("\n\n");
+  c.out.append(chunk_frame(frame));
+  c.last_stream_write = std::chrono::steady_clock::now();
+  return true;
+}
+
+void HttpResponseWriter::ping_if_idle(int interval_s) {
+  if (interval_s <= 0 || conn_ == nullptr || !conn_->stream || conn_->flushed < conn_->out.size())
+    return;
+  if (std::chrono::steady_clock::now() - conn_->last_stream_write >=
+      std::chrono::seconds(interval_s))
+    write_comment("keep-alive");
 }
 
 void HttpResponseWriter::end_stream() {
@@ -290,16 +310,6 @@ void HttpServer::serve() {
         (void)process_requests(*c);
     }
     for (auto& [fd, c] : conns_) {
-      // Long prefills and queued requests can be silent for minutes. SSE
-      // comments keep the HTTP stream active without creating a data event.
-      // Do not accumulate heartbeats behind a blocked socket's pending data.
-      if (c->fd >= 0 && c->stream && !c->closing && c->out.empty()) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now - c->last_stream_output >= kStreamHeartbeat) {
-          c->out.append(chunk_frame(": keep-alive\n\n"));
-          c->last_stream_output = now;
-        }
-      }
       if (c->fd >= 0 && !c->out.empty()) {
         flush_out(*c);
         if (c->fd >= 0 && c->closing && c->flushed >= c->out.size())
@@ -560,6 +570,7 @@ bool HttpServer::flush_out(Conn& c) {
                MSG_NOSIGNAL);
     if (put > 0) {
       c.flushed += static_cast<size_t>(put);
+      if (c.stream) c.last_stream_write = std::chrono::steady_clock::now();
       continue;
     }
     if (put < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {

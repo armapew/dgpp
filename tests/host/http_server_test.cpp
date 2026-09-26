@@ -143,6 +143,21 @@ class TestHandler : public HttpHandler {
       w.write_event("second");
       w.write_event("third");
       w.end_stream();
+    } else if (req.path == "/comments" && req.method == "GET") {
+      require(!w.write_comment("before"), "comments require an open stream");
+      w.begin_stream();
+      require(w.write_comment("keep-alive"), "comment queued");
+      bool rejected = false;
+      try {
+        w.write_comment("unsafe\ndata: injected");
+      } catch (const std::invalid_argument&) {
+        rejected = true;
+      }
+      require(rejected, "a comment cannot inject an SSE event");
+      w.write_event("[DONE]");
+      w.end_stream();
+      require(!w.write_comment("after"), "no comments after termination");
+      w.ping_if_idle(1);
     } else if (req.path == "/drip" && req.method == "GET") {
       w.begin_stream();
       drip_.push_back(&w);  // drained from idle(), like the service
@@ -202,27 +217,6 @@ struct ServerHandle {
 };
 
 const char* kGetHello = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n";
-
-DGPP_TEST(http_silent_sse_emits_comment_heartbeat_without_data_event) {
-  ServerHandle sh;
-  Client stream(sh.port());
-  stream.send_all("GET /tagged HTTP/1.1\r\nHost: t\r\n\r\n");
-  const std::string head = stream.read_available(100);
-  require(head.find("text/event-stream") != std::string::npos, "SSE headers");
-  require(head.find("data:") == std::string::npos, "silent stream has no model event");
-  std::this_thread::sleep_for(std::chrono::milliseconds(15100));
-  const std::string heartbeat = stream.read_available(100);
-  require(heartbeat == "e\r\n: keep-alive\n\n\r\n", "one correctly chunked SSE comment");
-  require(heartbeat.find("data:") == std::string::npos, "heartbeat is not a model event");
-  Client other(sh.port());
-  other.send_all(kGetHello);
-  require(other.read_available(100).find("{\"ok\":true}") != std::string::npos,
-          "silent stream does not block other requests");
-  stream.hard_close();
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  require(sh.handler.disconnects == 1 && sh.handler.last_tag == 42,
-          "heartbeat stream retains the normal cancellation hook");
-}
 
 DGPP_TEST(http_default_bind_does_not_accept_other_loopback_addresses) {
   ServerHandle sh;
@@ -437,6 +431,16 @@ DGPP_TEST(http_sseStream_chunkedEventsInOrderWithTerminal) {
   require(first < second && second < third, "events in order");
   require(terminal != std::string::npos && terminal > third,
           "terminal chunk after the last event");
+}
+
+DGPP_TEST(http_sseComments_chunkedFramingAndStreamBoundaries) {
+  ServerHandle sh;
+  Client client(sh.port());
+  client.send_all("GET /comments HTTP/1.1\r\nHost: t\r\n\r\n");
+  const auto response = client.read_available(100);
+  const auto body = response.substr(response.find("\r\n\r\n") + 4);
+  require(body == "e\r\n: keep-alive\n\n\r\ne\r\ndata: [DONE]\n\n\r\n0\r\n\r\n",
+          "comment and event have distinct SSE framing inside valid HTTP chunks: " + body);
 }
 
 DGPP_TEST(http_sseIdleDrain_eventsArriveAcrossLoopPasses) {
