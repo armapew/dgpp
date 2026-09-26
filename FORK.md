@@ -5,8 +5,8 @@ GB10 serving `nvidia/Qwen3.8-Flash-Next-NVFP4`. The main consumer is an agent on
 another machine. Favor reliable streaming, prompt reuse, decode throughput and
 memory headroom. Keep general fixes suitable for eventual upstream submission.
 
-Upstream is [HawkBearPig/dgpp](https://github.com/HawkBearPig/dgpp). The intended
-fork is `armapew/dgpp`. Repository publication and production deployment are
+Upstream is [HawkBearPig/dgpp](https://github.com/HawkBearPig/dgpp). The maintained
+fork is [armapew/dgpp](https://github.com/armapew/dgpp). Repository publication and production deployment are
 separate operations.
 
 ## Branches and releases
