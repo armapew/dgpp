@@ -10,7 +10,7 @@ import sys
 import tempfile
 
 
-LENGTHS = (127, 128, 129, 256, 513, 1024)
+LENGTHS = (127, 128, 129, 256, 513, 1024, 2048, 4096)
 VOCAB = 512
 
 
