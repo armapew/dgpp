@@ -287,7 +287,9 @@ void rank_work_mtp(int r, const QwenTextConfig& cfg, const std::string& dir, con
     BusBoundaryReducer reducer(*bus, wait_timeout_ms());
     auto* boundary = world > 1 ? &reducer : nullptr;
     QwenModel eager(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, boundary, r, world, kSlots);
-    QwenModel mtp(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, boundary, r, world, kSlots, /*mtp=*/true);
+    QwenModel mtp(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, boundary, r, world, kSlots,
+                  /*mtp=*/true, /*decode_rows=*/kSlots * (1 + depth), /*fp8_head_mma=*/false,
+                  /*serving_logits=*/true);
     DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
                                sizeof(uint16_t) * dgpp::kPickScratchElems(world), cudaHostAllocDefault));
     arrive_once();
@@ -400,7 +402,7 @@ DGPP_TEST(qwen_engines_world_of_one_mtp_graph_matches_plain_decode) {
     bool first = true;
     for (bool mapped : {false, true}) {
       dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
-      for (int depth : {1, 2}) {
+      for (int depth : {1, 2, 3}) {
         auto buses = start_world(1, kPort + 20);
         require(buses.size() == 1, "world-of-one bus failed to start");
         ConstructBarrier barrier(1);
