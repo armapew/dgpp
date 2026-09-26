@@ -106,7 +106,7 @@ Case make_case(int tokens, int experts, int topk, int n, int k, uint32_t seed) {
   }
   int row = 0;
   for (int e = 0; e < experts; ++e) {
-    if (by_expert[e].empty()) continue;
+    // Include empty segments, as the production device router does.
     c.segs.push_back(MoeSegment{row, static_cast<int32_t>(by_expert[e].size()), e});
     for (int t : by_expert[e]) c.act_rows.push_back(t);
     row += static_cast<int>(by_expert[e].size());
@@ -170,6 +170,12 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_exact, const
   const std::vector<float> o4 = host(out4, static_cast<size_t>(rows) * n);
   const std::vector<float> o16 = host(out16, static_cast<size_t>(rows) * n);
   int fails = 0;
+  // A full-output digest supports bitwise wide-grid / bounded-grid A/Bs.
+  uint64_t digest = 14695981039346656037ull;
+  const auto* bytes = reinterpret_cast<const uint8_t*>(o4.data());
+  for (size_t i = 0; i < o4.size() * sizeof(float); ++i)
+    digest = (digest ^ bytes[i]) * 1099511628211ull;
+  std::printf("[ .. ] %s f32 digest %016llx\n", label, static_cast<unsigned long long>(digest));
 
   // 1. layouts: fp64 dot of the quantized operands, dequantized exactly.
   if (check_exact) {
@@ -179,7 +185,8 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_exact, const
     double worst = 0;
     for (const MoeSegment& s : c.segs) {
       const Matrix& m = c.w[s.expert];
-      for (int r = 0; r < s.rows; r += std::max(1, s.rows / 3)) {
+      for (int r : {0, 1, 63, 64, 127, 128, 255, 256, 511, 512, s.rows - 1}) {
+        if (r < 0 || r >= s.rows) continue;
         const int tok = c.act_rows[s.row0 + r];
         for (int col = 0; col < n; col += 37) {
           double dot = 0, mag = 0;
@@ -282,6 +289,11 @@ int main(int argc, char** argv) {
   // A static global (the checkpoint's input_scale form) small enough that the
   // 20x outliers clip: the layouts must still be exact on the clipped codes.
   fails += run(200, 16, 4, 320, 320, true, "static-clip", 2.0f / (6.f * 448.f));
+  // Empty segments and hot experts crossing several row tiles, including
+  // both row/column tails and K=320's partial final pipeline stage.
+  fails += run(13, 32, 1, 130, 320, true, "empty-segments");
+  fails += run(513, 1, 1, 130, 320, true, "hot-expert");
+  fails += run(385, 4, 4, 256, 256, true, "all-hot-experts");
   // Prefill shapes (the Qwen experts per rank at TP=2: gate/up n = 320,
   // k = 2560; down n = 2560, k = 320).
   fails += run(tokens, experts, topk, 640, 2560, false, "gate_up");

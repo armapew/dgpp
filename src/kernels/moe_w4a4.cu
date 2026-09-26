@@ -217,7 +217,7 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
   constexpr size_t kACodesT = TL::a_codes, kAScalesT = TL::a_scales, kSlotT = TL::slot;
   extern __shared__ __align__(16) uint8_t smem[];
   const MoeSegment seg = segs[blockIdx.y];
-  const int m_tile = static_cast<int>(blockIdx.x) % m_tiles;
+  const int first_m_tile = static_cast<int>(blockIdx.x) % m_tiles;
   // kNT consecutive n-tiles per CTA: one cp.async ring runs across
   // the tiles, so a short-k GEMM (the down projection, k = 320: 2.5 stages a
   // tile) pays its pipeline prologue once per CTA, and each tile's epilogue
@@ -227,185 +227,191 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
   const int t0 = n_group * kNT;
   const int tiles_here = min(kNT, n_tiles_total - t0);
   if (tiles_here <= 0) return;
-  const int m0 = m_tile * kBM;
-  if (m0 >= seg.rows) return;
-  const int m_rows = min(kBM, seg.rows - m0);
-  const MoeExpertView v = views[seg.expert * 3 + which];
-  const float inv_g = 1.f / *v.fp4_global;
-  const size_t w_code_stride = static_cast<size_t>(k) / 2;
-  const size_t w_scale_stride = static_cast<size_t>(k) / 16;
-  const int tid = static_cast<int>(threadIdx.x);
-  const int warp = tid >> 5, lane = tid & 31;
-  const int q = lane >> 2, t = lane & 3;
-  const int wm = warp / TL::wn_warps, wn = warp % TL::wn_warps;  // (kBM/32) x (8 / that) warps
-  const int stages = (k + BK - 1) / BK;
+  // The device router knows the actual segment size. Bound the host grid
+  // and walk remaining row tiles here instead of launching max_rows/BM
+  // CTAs per expert, most of which immediately exit on sparse routing.
+  // Each tile keeps the original accumulation order and owns disjoint rows.
+  for (int m_tile = first_m_tile; m_tile * kBM < seg.rows; m_tile += m_tiles) {
+    const int m0 = m_tile * kBM;
+    const int m_rows = min(kBM, seg.rows - m0);
+    const MoeExpertView v = views[seg.expert * 3 + which];
+    const float inv_g = 1.f / *v.fp4_global;
+    const size_t w_code_stride = static_cast<size_t>(k) / 2;
+    const size_t w_scale_stride = static_cast<size_t>(k) / 16;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5, lane = tid & 31;
+    const int q = lane >> 2, t = lane & 3;
+    const int wm = warp / TL::wn_warps, wn = warp % TL::wn_warps;  // (kBM/32) x (8 / that) warps
+    const int stages = (k + BK - 1) / BK;
 
-  // Per-thread copy assignments (fixed across stages).
-  // A codes: kBM / 64 passes of (row tid/4 + 64 p, 16-byte chunk tid%4).
-  constexpr int kAPasses = kBM / 64;
-  const int a_chunk = tid & 3;
-  int a_row[kAPasses];
-  bool a_ok[kAPasses];
-  const uint8_t* a_code_src[kAPasses];
-#pragma unroll
-  for (int p = 0; p < kAPasses; ++p) {
-    a_row[p] = (tid >> 2) + 64 * p;
-    a_ok[p] = a_row[p] < m_rows;
-    int src_row = 0;
-    if (a_ok[p]) {
-      const int srow = seg.row0 + m0 + a_row[p];
-      src_row = act_rows != nullptr ? act_rows[srow] : srow;
-    }
-    a_code_src[p] = a_codes + static_cast<size_t>(src_row) * a_code_stride;
-  }
-  // A scales: threads 0..63, one 8-byte copy each (row tid).
-  int as_src_row = 0;
-  const bool as_ok = tid < kBM && tid < m_rows;
-  if (as_ok) {
-    const int srow = seg.row0 + m0 + tid;
-    as_src_row = act_rows != nullptr ? act_rows[srow] : srow;
-  }
-  const uint8_t* a_scale_src = a_scales + static_cast<size_t>(as_src_row) * a_scale_stride;
-  // B codes: two 16-byte chunks per thread: rows (tid + 256 i) / 4.
-  // B scales: row tid/2, 4-byte half tid%2.
-  const int bs_row = tid >> 1, bs_half = tid & 1;
-
-  auto slot_ptr = [&](int slot) { return smem + static_cast<size_t>(slot) * kSlotT; };
-
-  // f: the flattened (tile, stage) index across this CTA's tiles.
-  auto issue = [&](int f, int slot) {
-    const int s = f % stages;
-    const int n0 = (t0 + f / stages) * BN;
-    const bool bs_ok = n0 + bs_row < n;
-    const uint8_t* b_scale_src = v.fp4_scales + static_cast<size_t>(bs_ok ? n0 + bs_row : 0) * w_scale_stride;
-    uint8_t* base = slot_ptr(slot);
-    const int kb0 = s * (BK / 2);  // code byte offset of this stage
-    const int kg0 = s * (BK / 16); // scale group offset
+    // Per-thread copy assignments (fixed across stages).
+    // A codes: kBM / 64 passes of (row tid/4 + 64 p, 16-byte chunk tid%4).
+    constexpr int kAPasses = kBM / 64;
+    const int a_chunk = tid & 3;
+    int a_row[kAPasses];
+    bool a_ok[kAPasses];
+    const uint8_t* a_code_src[kAPasses];
 #pragma unroll
     for (int p = 0; p < kAPasses; ++p) {
-      const int gb = kb0 + a_chunk * 16;
-      const int in = a_ok[p] ? max(0, min(16, k / 2 - gb)) : 0;
-      cp_async(base + a_row[p] * kRowBytes + a_chunk * 16, in > 0 ? a_code_src[p] + gb : a_codes, 16, in);
+      a_row[p] = (tid >> 2) + 64 * p;
+      a_ok[p] = a_row[p] < m_rows;
+      int src_row = 0;
+      if (a_ok[p]) {
+        const int srow = seg.row0 + m0 + a_row[p];
+        src_row = act_rows != nullptr ? act_rows[srow] : srow;
+      }
+      a_code_src[p] = a_codes + static_cast<size_t>(src_row) * a_code_stride;
     }
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int idx = tid + kThreads * i;
-      const int row = idx >> 2, chunk = idx & 3;
-      const int gn = n0 + row;
-      const int gb = kb0 + chunk * 16;
-      const int in = gn < n ? max(0, min(16, k / 2 - gb)) : 0;
-      const uint8_t* src = v.payload + static_cast<size_t>(gn < n ? gn : 0) * w_code_stride + gb;
-      cp_async(base + kACodesT + row * kRowBytes + chunk * 16, in > 0 ? src : v.payload, 16, in);
+    // A scales: threads 0..63, one 8-byte copy each (row tid).
+    int as_src_row = 0;
+    const bool as_ok = tid < kBM && tid < m_rows;
+    if (as_ok) {
+      const int srow = seg.row0 + m0 + tid;
+      as_src_row = act_rows != nullptr ? act_rows[srow] : srow;
     }
-    if (tid < kBM) {
-      const int in = as_ok ? max(0, min(8, k / 16 - kg0)) : 0;
-      cp_async(base + kACodesT + kBCodes + tid * kAScaleBytes, in > 0 ? a_scale_src + kg0 : a_scales, 8, in);
-    }
-    {
-      const int gg = kg0 + bs_half * 4;
-      const int in = bs_ok ? max(0, min(4, k / 16 - gg)) : 0;
-      cp_async(base + kACodesT + kBCodes + kAScalesT + bs_row * kAScaleBytes + bs_half * 4,
-               in > 0 ? b_scale_src + gg : v.fp4_scales, 4, in);
-    }
-  };
+    const uint8_t* a_scale_src = a_scales + static_cast<size_t>(as_src_row) * a_scale_stride;
+    // B codes: two 16-byte chunks per thread: rows (tid + 256 i) / 4.
+    // B scales: row tid/2, 4-byte half tid%2.
+    const int bs_row = tid >> 1, bs_half = tid & 1;
 
-  constexpr int NT = TL::nt, NC = TL::ncols;
-  float acc[2][NT][4];
-#pragma unroll
-  for (int i = 0; i < 2; ++i)
-#pragma unroll
-    for (int j = 0; j < NT; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+    auto slot_ptr = [&](int slot) { return smem + static_cast<size_t>(slot) * kSlotT; };
 
-  const int total = tiles_here * stages;
+    // f: the flattened (tile, stage) index across this CTA's tiles.
+    auto issue = [&](int f, int slot) {
+      const int s = f % stages;
+      const int n0 = (t0 + f / stages) * BN;
+      const bool bs_ok = n0 + bs_row < n;
+      const uint8_t* b_scale_src = v.fp4_scales + static_cast<size_t>(bs_ok ? n0 + bs_row : 0) * w_scale_stride;
+      uint8_t* base = slot_ptr(slot);
+      const int kb0 = s * (BK / 2);  // code byte offset of this stage
+      const int kg0 = s * (BK / 16); // scale group offset
 #pragma unroll
-  for (int f = 0; f < kStages - 1; ++f) {
-    if (f < total) issue(f, f);
-    cp_commit();
-  }
-  for (int f = 0; f < total; ++f) {
-    const int s = f % stages;
-    cp_wait<kStages - 2>();
-    __syncthreads();
-    {
-      const int nx = f + kStages - 1;
-      if (nx < total) issue(nx, nx % kStages);
+      for (int p = 0; p < kAPasses; ++p) {
+        const int gb = kb0 + a_chunk * 16;
+        const int in = a_ok[p] ? max(0, min(16, k / 2 - gb)) : 0;
+        cp_async(base + a_row[p] * kRowBytes + a_chunk * 16, in > 0 ? a_code_src[p] + gb : a_codes, 16, in);
+      }
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int idx = tid + kThreads * i;
+        const int row = idx >> 2, chunk = idx & 3;
+        const int gn = n0 + row;
+        const int gb = kb0 + chunk * 16;
+        const int in = gn < n ? max(0, min(16, k / 2 - gb)) : 0;
+        const uint8_t* src = v.payload + static_cast<size_t>(gn < n ? gn : 0) * w_code_stride + gb;
+        cp_async(base + kACodesT + row * kRowBytes + chunk * 16, in > 0 ? src : v.payload, 16, in);
+      }
+      if (tid < kBM) {
+        const int in = as_ok ? max(0, min(8, k / 16 - kg0)) : 0;
+        cp_async(base + kACodesT + kBCodes + tid * kAScaleBytes, in > 0 ? a_scale_src + kg0 : a_scales, 8, in);
+      }
+      {
+        const int gg = kg0 + bs_half * 4;
+        const int in = bs_ok ? max(0, min(4, k / 16 - gg)) : 0;
+        cp_async(base + kACodesT + kBCodes + kAScalesT + bs_row * kAScaleBytes + bs_half * 4,
+                 in > 0 ? b_scale_src + gg : v.fp4_scales, 4, in);
+      }
+    };
+
+    constexpr int NT = TL::nt, NC = TL::ncols;
+    float acc[2][NT][4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+      for (int j = 0; j < NT; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+
+    const int total = tiles_here * stages;
+#pragma unroll
+    for (int f = 0; f < kStages - 1; ++f) {
+      if (f < total) issue(f, f);
       cp_commit();
     }
-    const uint8_t* base = slot_ptr(f % kStages);
-    const uint8_t* ab = base;
-    const uint8_t* bb = base + kACodesT;
-    const uint32_t* asw = reinterpret_cast<const uint32_t*>(base + kACodesT + kBCodes);
-    const uint32_t* bsw = reinterpret_cast<const uint32_t*>(base + kACodesT + kBCodes + kAScalesT);
-    // ldmatrix.x4 lane addressing: lane l feeds row (l & 7) of matrix l >> 3.
-    const int lm = lane >> 3, lr = lane & 7;
-    // The stage's block-scale words for both k64 halves in one 8-byte load per
-    // row (2026-09-23: ncu put the kernel MIO-throttled -- 20 scale LDS per
-    // stage per warp beside 12 ldmatrix for 32 MMAs; this halves the scale LDS).
-    uint2 sfa2[2], sfb2[NT];
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int sr = wm * 32 + i * 16 + q + ((lane & 1) << 3);
-      sfa2[i] = *reinterpret_cast<const uint2*>(asw + sr * 2);
-    }
-#pragma unroll
-    for (int j = 0; j < NT; ++j) sfb2[j] = *reinterpret_cast<const uint2*>(bsw + (wn * NC + j * 8 + q) * 2);
-#pragma unroll
-    for (int kh = 0; kh < 2; ++kh) {  // two k64 steps per stage
-      uint32_t af[2][4], sfa[2];
+    for (int f = 0; f < total; ++f) {
+      const int s = f % stages;
+      cp_wait<kStages - 2>();
+      __syncthreads();
+      {
+        const int nx = f + kStages - 1;
+        if (nx < total) issue(nx, nx % kStages);
+        cp_commit();
+      }
+      const uint8_t* base = slot_ptr(f % kStages);
+      const uint8_t* ab = base;
+      const uint8_t* bb = base + kACodesT;
+      const uint32_t* asw = reinterpret_cast<const uint32_t*>(base + kACodesT + kBCodes);
+      const uint32_t* bsw = reinterpret_cast<const uint32_t*>(base + kACodesT + kBCodes + kAScalesT);
+      // ldmatrix.x4 lane addressing: lane l feeds row (l & 7) of matrix l >> 3.
+      const int lm = lane >> 3, lr = lane & 7;
+      // The stage's block-scale words for both k64 halves in one 8-byte load per
+      // row (2026-09-23: ncu put the kernel MIO-throttled -- 20 scale LDS per
+      // stage per warp beside 12 ldmatrix for 32 MMAs; this halves the scale LDS).
+      uint2 sfa2[2], sfb2[NT];
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
-        // matrices: rows +0/+8 (lm & 1) x bytes +0/+16 (lm >> 1) -> a0, a1, a2, a3.
-        const int row = wm * 32 + i * 16 + (lm & 1) * 8 + lr;
-        ldmatrix_x4(af[i], ab + row * kRowBytes + kh * 32 + (lm >> 1) * 16);
-        sfa[i] = kh == 0 ? sfa2[i].x : sfa2[i].y;
+        const int sr = wm * 32 + i * 16 + q + ((lane & 1) << 3);
+        sfa2[i] = *reinterpret_cast<const uint2*>(asw + sr * 2);
       }
 #pragma unroll
-      for (int jp = 0; jp < NT / 2; ++jp) {
-        // matrices: bytes +0/+16 (lm & 1) x n-tiles j/j+1 (lm >> 1) -> b0, b1 of each.
-        uint32_t bf[4];
-        const int col = wn * NC + jp * 16 + (lm >> 1) * 8 + lr;
-        ldmatrix_x4(bf, bb + col * kRowBytes + kh * 32 + (lm & 1) * 16);
+      for (int j = 0; j < NT; ++j) sfb2[j] = *reinterpret_cast<const uint2*>(bsw + (wn * NC + j * 8 + q) * 2);
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          const int j = jp * 2 + h;
-          const uint32_t sfb = kh == 0 ? sfb2[j].x : sfb2[j].y;
+      for (int kh = 0; kh < 2; ++kh) {  // two k64 steps per stage
+        uint32_t af[2][4], sfa[2];
 #pragma unroll
-          for (int i = 0; i < 2; ++i) mma_nvfp4(acc[i][j], af[i], bf[2 * h], bf[2 * h + 1], sfa[i], sfb);
+        for (int i = 0; i < 2; ++i) {
+          // matrices: rows +0/+8 (lm & 1) x bytes +0/+16 (lm >> 1) -> a0, a1, a2, a3.
+          const int row = wm * 32 + i * 16 + (lm & 1) * 8 + lr;
+          ldmatrix_x4(af[i], ab + row * kRowBytes + kh * 32 + (lm >> 1) * 16);
+          sfa[i] = kh == 0 ? sfa2[i].x : sfa2[i].y;
         }
-      }
-    }
-    if (s == stages - 1) {  // this tile's last stage: store it, clear for the next
-      const int n0 = (t0 + f / stages) * BN;
 #pragma unroll
-      for (int i = 0; i < 2; ++i) {
+        for (int jp = 0; jp < NT / 2; ++jp) {
+          // matrices: bytes +0/+16 (lm & 1) x n-tiles j/j+1 (lm >> 1) -> b0, b1 of each.
+          uint32_t bf[4];
+          const int col = wn * NC + jp * 16 + (lm >> 1) * 8 + lr;
+          ldmatrix_x4(bf, bb + col * kRowBytes + kh * 32 + (lm & 1) * 16);
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          const int mm = wm * 32 + i * 16 + q + h * 8;
-          if (mm >= m_rows) continue;
-          const int srow = seg.row0 + m0 + mm;
-          const float scale = a_gs[act_rows != nullptr ? act_rows[srow] : srow] * inv_g;
-          OutT* orow = out + static_cast<size_t>(srow) * out_stride;
+          for (int h = 0; h < 2; ++h) {
+            const int j = jp * 2 + h;
+            const uint32_t sfb = kh == 0 ? sfb2[j].x : sfb2[j].y;
 #pragma unroll
-          for (int j = 0; j < NT; ++j) {
-            const int col = n0 + wn * NC + j * 8 + 2 * t;
-            // Pairs as one 4-byte (bf16x2) / 8-byte (float2) store: col is even
-            // and rows are even-strided (the element-at-a-time stores made the
-            // output-heavy down projection store-instruction bound).
-            if (col + 1 < n) {
-              store_pair(orow + col, acc[i][j][2 * h] * scale, acc[i][j][2 * h + 1] * scale);
-            } else if (col < n) {
-              store_out(orow + col, acc[i][j][2 * h] * scale);
-            }
+            for (int i = 0; i < 2; ++i) mma_nvfp4(acc[i][j], af[i], bf[2 * h], bf[2 * h + 1], sfa[i], sfb);
           }
         }
       }
+      if (s == stages - 1) {  // this tile's last stage: store it, clear for the next
+        const int n0 = (t0 + f / stages) * BN;
 #pragma unroll
-      for (int i = 0; i < 2; ++i)
+        for (int i = 0; i < 2; ++i) {
 #pragma unroll
-        for (int j = 0; j < NT; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+          for (int h = 0; h < 2; ++h) {
+            const int mm = wm * 32 + i * 16 + q + h * 8;
+            if (mm >= m_rows) continue;
+            const int srow = seg.row0 + m0 + mm;
+            const float scale = a_gs[act_rows != nullptr ? act_rows[srow] : srow] * inv_g;
+            OutT* orow = out + static_cast<size_t>(srow) * out_stride;
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+              const int col = n0 + wn * NC + j * 8 + 2 * t;
+              // Pairs as one 4-byte (bf16x2) / 8-byte (float2) store: col is even
+              // and rows are even-strided (the element-at-a-time stores made the
+              // output-heavy down projection store-instruction bound).
+              if (col + 1 < n) {
+                store_pair(orow + col, acc[i][j][2 * h] * scale, acc[i][j][2 * h + 1] * scale);
+              } else if (col < n) {
+                store_out(orow + col, acc[i][j][2 * h] * scale);
+              }
+            }
+          }
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+#pragma unroll
+          for (int j = 0; j < NT; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+      }
     }
+    cp_wait<0>();
+    __syncthreads();  // All readers/stores finish before shared memory is reused.
   }
-  cp_wait<0>();
 }
 
 }  // namespace
@@ -471,7 +477,15 @@ static void launch_w4a4(const uint8_t* codes, const uint8_t* scales, const float
     return true;
   }();
   (void)opted;
-  const int m_tiles = (max_rows + bm - 1) / bm;
+  // Two row tiles per expert give ample parallelism across experts and
+  // output columns. 0 restores the original wide grid for controlled A/Bs.
+  static const int row_tile_cap = [] {
+    const char* e = std::getenv("DGPP_W4A4_ROW_TILES");
+    const int value = e != nullptr ? std::atoi(e) : 2;
+    return value >= 0 ? value : 2;
+  }();
+  const int full_m_tiles = (max_rows + bm - 1) / bm;
+  const int m_tiles = row_tile_cap > 0 && row_tile_cap < full_m_tiles ? row_tile_cap : full_m_tiles;
   const unsigned n_tiles = static_cast<unsigned>((n + BN - 1) / BN);
   const size_t cs = static_cast<size_t>(k) / 2, ss = nvfp4_act_scale_stride(k);
   // n-tiles per CTA (DGPP_W4A4_NT=1|2|4; measured neutral, default 1).
