@@ -512,6 +512,7 @@ DGPP_TEST(qwen_engines_world_of_one_scalar_crossover_retire_and_reuse) {
       GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
           cfg.vocab_size, wait_timeout_ms(), 5, nullptr, nullptr, 0, nullptr, 0, 1, false);
       require(graph.batch_min_live() == 5, "explicit scalar crossover must not be clamped to slot count");
+      require(graph.prefill_group_span_limit() == 0, "scalar mode must not combine cold prompt forwards");
       const std::array<size_t, 5> lengths{9, 33, 17, 25, 17};
       std::vector<std::vector<int32_t>> expected(5), actual(5);
       // Establish each transcript in isolation, using the same MTP setting.
@@ -526,8 +527,10 @@ DGPP_TEST(qwen_engines_world_of_one_scalar_crossover_retire_and_reuse) {
         graph.close(0);
       }
       std::array<int, 4> jobs{0, 1, 2, 3};
+      const auto firsts = graph.prefill_group({0, 1, 2, 3},
+          {&prompts[0], &prompts[1], &prompts[2], &prompts[3]});
       for (int slot = 0; slot < 4; ++slot) {
-        actual[slot].push_back(graph.prefill(slot, prompts[slot]));
+        actual[slot].push_back(firsts[slot]);
         graph.reserve(slot, prompts[slot].size() + 48);
       }
       std::vector<int> active{0, 1, 2, 3};

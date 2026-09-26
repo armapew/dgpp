@@ -468,7 +468,9 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     }
     // slots_ + 1 deliberately never crosses over: retain independent scalar
     // decode graphs as requests join/retire, without reducing admission slots.
-    // This controls decode shape, not prefill/cache numerical equivalence.
+    // Also keep short cold prompts out of a shared prefill forward. Fixed
+    // chunk budgets and compatible cache histories remain site-level choices.
+    separate_prefill_ = batch_min_live == slots_ + 1;
     batch_min_live_ = std::clamp(batch_min_live, 1, slots_ + 1);
     if (batch_unavailable_) {
       // Never reached by the live count: every step replays a scalar graph.
@@ -1111,6 +1113,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   // (session_prefill_group), each slot's opening work per request around
   // it. A family without span support prefills them one by one.
   int64_t prefill_group_span_limit() const override {
+    if (separate_prefill_) return 0;
     if constexpr (requires { model_->prefill_group_span_limit(); })
       return model_->prefill_group_span_limit();
     else
@@ -3072,6 +3075,7 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
   std::vector<int> hop_slot_;          // per slot: the armed hop's arena slot, -1 none
   std::vector<int64_t> hop_position_;  // per slot: the armed hop's position
   int batch_min_live_ = 1;
+  bool separate_prefill_ = false;
   int last_mode_ = -1;  // 0 scalar variants, 1 + family for a row batch
   DecodePick prefill_pick_;
   std::unique_ptr<DevicePicker> picker_;
