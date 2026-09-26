@@ -117,8 +117,9 @@ std::vector<std::unique_ptr<CollectiveBus>> start_world(int world, uint16_t port
 struct ConstructBarrier {
   std::mutex mu;
   std::condition_variable cv;
+  const int world;
   int left;
-  explicit ConstructBarrier(int world) : left(world) {}
+  explicit ConstructBarrier(int count) : world(count), left(count) {}
   void arrive_and_wait() {
     std::unique_lock<std::mutex> lock(mu);
     if (--left == 0) cv.notify_all();
@@ -282,20 +283,22 @@ void rank_work_mtp(int r, const QwenTextConfig& cfg, const std::string& dir, con
   };
   uint16_t* scratch = nullptr;
   try {
+    const int world = barrier->world;
     BusBoundaryReducer reducer(*bus, wait_timeout_ms());
-    QwenModel eager(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, &reducer, r, kWorld, kSlots);
-    QwenModel mtp(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, &reducer, r, kWorld, kSlots, /*mtp=*/true);
+    auto* boundary = world > 1 ? &reducer : nullptr;
+    QwenModel eager(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, boundary, r, world, kSlots);
+    QwenModel mtp(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, boundary, r, world, kSlots, /*mtp=*/true);
     DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
-                               sizeof(uint16_t) * dgpp::kPickScratchElems(kWorld), cudaHostAllocDefault));
+                               sizeof(uint16_t) * dgpp::kPickScratchElems(world), cudaHostAllocDefault));
     arrive_once();
     EagerEngineAdapter<QwenModel> eager_engine(
-        &eager, kSlots, dgpp::make_fabric_pick(bus, r, kWorld, scratch, cfg.vocab_size, wait_timeout_ms()));
+        &eager, kSlots, dgpp::make_fabric_pick(bus, r, world, scratch, cfg.vocab_size, wait_timeout_ms()));
     out->ea = solo(eager_engine, 0, A, kSteps);
     out->eb = solo(eager_engine, 1, B, kSteps);
     out->ec = solo(eager_engine, 2, C, kSteps);
     {
       GraphEngineAdapter<QwenModel> mtp_engine(
-          &mtp, bus, r, kWorld, scratch, cfg.vocab_size, wait_timeout_ms(),
+          &mtp, bus, r, world, scratch, cfg.vocab_size, wait_timeout_ms(),
           /*batch_min_live=*/2, /*prefix_scratch=*/nullptr,
           /*gather_scratch=*/nullptr, /*candidates=*/0, /*grammar=*/nullptr,
           /*prefix_slots=*/0, /*mtp_depth=*/depth, test_compaction());
@@ -373,6 +376,49 @@ void rank_work_mtp(int r, const QwenTextConfig& cfg, const std::string& dir, con
 }
 
 }  // namespace
+
+DGPP_TEST(qwen_engines_world_of_one_mtp_graph_matches_plain_decode) {
+  // Single-Spark serving has no RoCE lane. Exercise the production identity
+  // bus with both draft depths and table modes, without requiring a fabric.
+  const QwenTextConfig cfg = qwenfx::tiny_config();
+  const std::string dir = "qwen_engine_world1_fixture";
+  qwenfx::write_fixture(cfg, dir);
+  const auto A = smoke_tokens(cfg, 23, 0x9E3779B97F4A7C15ull);
+  const auto B = smoke_tokens(cfg, 17, 0xD1B54A32D192ED03ull);
+  const auto C = smoke_tokens(cfg, 11, 0x2545F4914F6CDD1Dull);
+  struct RestoreModes {
+    bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();
+    bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
+    ~RestoreModes() {
+      dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
+      dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
+    }
+  } restore;
+  for (bool fp8 : {false, true}) {
+    dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
+    Ref reference;
+    bool first = true;
+    for (bool mapped : {false, true}) {
+      dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
+      for (int depth : {1, 2}) {
+        auto buses = start_world(1, kPort + 20);
+        require(buses.size() == 1, "world-of-one bus failed to start");
+        ConstructBarrier barrier(1);
+        RankOutcome result;
+        rank_work_mtp(0, cfg, dir, A, B, C, buses[0].get(), &barrier, &result, depth);
+        require(result.error.empty(), result.error);
+        require(result.ma == result.ea && result.mb == result.eb && result.mc == result.ec,
+                "world-of-one scalar/batched MTP differs from plain eager decode");
+        if (first) {
+          reference = Ref{result.ea, result.eb, result.ec};
+          first = false;
+        }
+        require(result.ma == reference.a && result.mb == reference.b && result.mc == reference.c,
+                "world-of-one mapped table or draft depth changes the transcript");
+      }
+    }
+  }
+}
 
 DGPP_TEST(qwen_engines_loopback_world_2_mtp_graph_matches_plain_decode) {
   const QwenTextConfig cfg = qwenfx::tiny_config();
