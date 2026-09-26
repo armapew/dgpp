@@ -473,6 +473,44 @@ DGPP_TEST(qsa_index_score_and_select_match_the_reference_bitwise) {
   std::printf(" tokens, keys and lists bitwise\n");
 }
 
+DGPP_TEST(qsa_index_score_bounded_grid_and_compact_stride_preserve_visible_keys) {
+  SelectFixture sf(20260926);
+  const Geo& g = sf.f.g;
+  cudaStream_t st = test_stream();
+  const int64_t compact = (*std::max_element(sf.pos.begin(), sf.pos.end()) + 1) / g.kpool;
+  const int64_t wide = 4096;  // Many empty stripes beyond this request's keys.
+  const auto score = [&](int64_t stride, int64_t bound) {
+    DevBuf keys(static_cast<size_t>(sf.rows()) * stride * 8);
+    DGPP_CUDA_OK(cudaMemsetAsync(keys.p, 0xff, static_cast<size_t>(sf.rows()) * stride * 8, st));
+    dgpp::qsa_index_score(ptr<uint16_t>(sf.dq), static_cast<int64_t>(g.idx_heads) * g.idx_dim,
+        ptr<int32_t>(sf.dreq), ptr<int64_t>(sf.dpos), sf.rows(), ptr<int32_t>(sf.f.dtable),
+        g.blocks_per_request, ptr<uint16_t>(sf.dcache), g.pools_per_block(), g.idx_heads,
+        g.idx_dim, g.kpool, mptr<uint64_t>(keys), stride, st, bound);
+    DGPP_CUDA_OK(cudaStreamSynchronize(st));
+    return down<uint64_t>(keys, static_cast<size_t>(sf.rows()) * stride);
+  };
+  const auto reference = score(wide, -1);
+  const auto bounded = score(wide, compact);
+  require(reference == bounded, "bounded launch changes scores or untouched padding");
+  const auto small = score(compact, compact);
+  for (int r = 0; r < sf.rows(); ++r)
+    for (int64_t p = 0; p < compact; ++p)
+      require(small[static_cast<size_t>(r) * compact + p] ==
+              reference[static_cast<size_t>(r) * wide + p], "compact row stride changes scores");
+  // Before the first complete compressed pool, scoring must launch no work;
+  // selection uses only the incomplete tail. Include inactive padding rows.
+  sf.pos.assign(static_cast<size_t>(sf.rows()), g.kpool - 2);
+  sf.pos.back() = -1;
+  sf.dpos.upload(sf.pos.data(), sf.pos.size() * sizeof(int64_t));
+  require(score(wide, -1) == score(wide, 0), "zero-visible launch changes padding");
+  for (int64_t invalid : {int64_t{-2}, wide + 1}) {
+    bool threw = false;
+    try { (void)score(wide, invalid); }
+    catch (const std::invalid_argument&) { threw = true; }
+    require(threw, "invalid visible bound accepted");
+  }
+}
+
 DGPP_TEST(qsa_index_large_paged_pools_match_every_host_key_and_token) {
   // Preserve the reviewer's 65322-pool / position-261288 case as a normal
   // gate, then cross the 128K-pool boundary. Neither the score stripe nor
