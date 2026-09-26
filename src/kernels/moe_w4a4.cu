@@ -220,8 +220,8 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
   int m_tile = static_cast<int>(blockIdx.x) % m_tiles;
   int n_group = static_cast<int>(blockIdx.x) / m_tiles;
   if (row_jobs > 0) {
-    const int job = static_cast<int>(blockIdx.x) % row_jobs;
-    n_group = static_cast<int>(blockIdx.x) / row_jobs;
+    const int job = static_cast<int>(blockIdx.x);
+    const int groups = ((n + BN - 1) / BN + kNT - 1) / kNT;
     // start(i) = floor(row0(i)/BM) + i is strictly increasing, including
     // empty experts. Its interval holds ceil(rows(i)/BM) tiles plus at
     // most one empty tile. Thus floor(total_rows/BM)+n_segs jobs cover
@@ -229,12 +229,18 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
     int lo = 0, hi = n_segs;
     while (lo + 1 < hi) {
       const int mid = lo + (hi - lo) / 2;
-      if (segs[mid].row0 / kBM + mid <= job) lo = mid;
+      if ((segs[mid].row0 / kBM + mid) * groups <= job) lo = mid;
       else hi = mid;
     }
     segment = lo;
-    m_tile = job - (segs[segment].row0 / kBM + segment);
-    if (m_tile < 0) return;
+    const int start = segs[segment].row0 / kBM + segment;
+    const int end = segment + 1 < n_segs ? segs[segment + 1].row0 / kBM + segment + 1 : row_jobs;
+    const int local = job - start * groups;
+    if (local < 0) return;
+    // Preserve expert -> output-column -> row-tile order for weight and
+    // activation locality, while keeping every populated tile parallel.
+    m_tile = local % (end - start);
+    n_group = local / (end - start);
   }
   const MoeSegment seg = segs[segment];
   // kNT consecutive n-tiles per CTA: one cp.async ring runs across
@@ -259,8 +265,8 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
   const int stages = (k + BK - 1) / BK;
 
   // Per-thread copy assignments (fixed across stages).
-  // A codes: kBM / 64 passes of (row tid/4 + 64 p, 16-byte chunk tid%4).
-  constexpr int kAPasses = kBM / 64;
+  // A codes: ceil(kBM / 64) passes; BM32 masks the unused copy threads.
+  constexpr int kAPasses = (kBM + 63) / 64;
   const int a_chunk = tid & 3;
   int a_row[kAPasses];
   bool a_ok[kAPasses];
@@ -303,7 +309,8 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
     for (int p = 0; p < kAPasses; ++p) {
       const int gb = kb0 + a_chunk * 16;
       const int in = a_ok[p] ? max(0, min(16, k / 2 - gb)) : 0;
-      cp_async(base + a_row[p] * kRowBytes + a_chunk * 16, in > 0 ? a_code_src[p] + gb : a_codes, 16, in);
+      if (a_row[p] < kBM)
+        cp_async(base + a_row[p] * kRowBytes + a_chunk * 16, in > 0 ? a_code_src[p] + gb : a_codes, 16, in);
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -473,13 +480,16 @@ static void launch_w4a4(const uint8_t* codes, const uint8_t* scales, const float
     const char* e = std::getenv("DGPP_W4A4_STAGES");
     return e != nullptr && std::atoi(e) == 3 ? 3 : 2;
   }();
-  // DGPP_W4A4_BM=64|128 (default 128; idle GPU, moe_w4a4_test at 8,192
+  // DGPP_W4A4_BM=32|64|128 (default 128; idle GPU, moe_w4a4_test at 8,192
   // tokens x top-10: gate/up 3.40 -> 3.27 ms, down 5.27 -> 4.89 ms).
   static const int bm = [] {
     const char* e = std::getenv("DGPP_W4A4_BM");
-    return e != nullptr && std::atoi(e) == 64 ? 64 : 128;
+    const int value = e != nullptr ? std::atoi(e) : 128;
+    return value == 32 || value == 64 ? value : 128;
   }();
   static const bool opted = [] {  // once per process and OutT, thread-safe
+    DGPP_CUDA_OK(cudaFuncSetAttribute(moe_grouped_w4a4_kernel<OutT, 2, 32>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes_bm<2, 32>())));
     DGPP_CUDA_OK(cudaFuncSetAttribute(moe_grouped_w4a4_kernel<OutT, 2, 64>,
                                       cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes_bm<2, 64>())));
     DGPP_CUDA_OK(cudaFuncSetAttribute(moe_grouped_w4a4_kernel<OutT, 3, 64>,
@@ -533,6 +543,9 @@ static void launch_w4a4(const uint8_t* codes, const uint8_t* scales, const float
   const dim3 grid = grid_for(n_tiles);
   if (bm == 128)
     moe_grouped_w4a4_kernel<OutT, 2, 128><<<grid, kThreads, smem_bytes_bm<2, 128>(), stream>>>(
+        codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles, n_segs, row_jobs);
+  else if (bm == 32)
+    moe_grouped_w4a4_kernel<OutT, 2, 32><<<grid, kThreads, smem_bytes_bm<2, 32>(), stream>>>(
         codes, cs, scales, ss, gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles, n_segs, row_jobs);
   else if (stages == 3)
     moe_grouped_w4a4_kernel<OutT, 3, 64><<<grid, kThreads, smem_bytes_bm<3, 64>(), stream>>>(

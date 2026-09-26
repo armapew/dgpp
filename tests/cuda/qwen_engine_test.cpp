@@ -438,7 +438,7 @@ DGPP_TEST(qwen_engines_world_of_one_four_slots_compact_fp8_head) {
   qwenfx::write_fixture(cfg, dir);
   std::vector<std::vector<int64_t>> prompts;
   for (int i = 0; i < 4; ++i) prompts.push_back(smoke_tokens(cfg, 17 + i * 4, 0xAB00 + i));
-  for (int depth : {1, 2, 3, 4, 5}) {
+  for (bool compact_batches : {false, true}) for (int depth : {1, 2, 3, 4, 5}) {
     auto buses = start_world(1, kPort + 21);
     require(buses.size() == 1, "world-of-one four-slot bus");
     const int rows = 4 * (depth + 1);
@@ -448,31 +448,34 @@ DGPP_TEST(qwen_engines_world_of_one_four_slots_compact_fp8_head) {
                     true, rows, true, true);
     EagerEngineAdapter<QwenModel> plain(&eager, 4, dgpp::make_w1_pick(cfg.vocab_size));
     std::vector<std::vector<int32_t>> expected;
-    for (int i = 0; i < 4; ++i) expected.push_back(solo(plain, i, prompts[i], 24));
+    for (int i = 0; i < 4; ++i) expected.push_back(solo(plain, i, prompts[i], 12 + i * 6));
     uint16_t* scratch = nullptr;
     DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
                                sizeof(uint16_t) * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
     {
       GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
-          cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 0, nullptr, 0, depth, false);
+          cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 0, nullptr, 0, depth, compact_batches);
       std::vector<std::vector<int32_t>> actual(4);
       for (int i = 0; i < 4; ++i) {
         actual[i].push_back(graph.prefill(i, prompts[i]));
-        graph.reserve(i, prompts[i].size() + 32 + depth);
+        graph.reserve(i, prompts[i].size() + 48 + depth);
       }
-      bool complete = false;
-      while (!complete) {
-        const auto tokens = graph.step_batch({0, 1, 2, 3});
-        complete = true;
-        for (int i = 0; i < 4; ++i) {
-          actual[i].insert(actual[i].end(), tokens[i].begin(), tokens[i].end());
-          complete &= actual[i].size() >= expected[i].size();
+      std::vector<int> active{0, 1, 2, 3};
+      while (!active.empty()) {
+        const auto tokens = graph.step_batch(active);
+        std::vector<int> remaining;
+        for (size_t j = 0; j < active.size(); ++j) {
+          const int i = active[j];
+          actual[i].insert(actual[i].end(), tokens[j].begin(), tokens[j].end());
+          if (actual[i].size() >= expected[i].size()) {
+            actual[i].resize(expected[i].size());
+            require(actual[i] == expected[i], "four-slot compact FP8/MMA head differs from eager, depth " + std::to_string(depth));
+            graph.close(i);
+          } else {
+            remaining.push_back(i);
+          }
         }
-      }
-      for (int i = 0; i < 4; ++i) {
-        actual[i].resize(expected[i].size());
-        require(actual[i] == expected[i], "four-slot compact FP8/MMA head differs from eager, depth " + std::to_string(depth));
-        graph.close(i);
+        active = std::move(remaining);
       }
       graph.drain();
     }
