@@ -18,6 +18,7 @@ separate operations.
 | `work/*` | Improvements and upstream integration candidates |
 | `archive/optimization-20260926` | Original experiment history, including reverted candidates |
 | `spark-2026.09.26.1` | Immutable tag for the original validated source `d44bebb61205` |
+| `spark-2026.09.26.2` | Validated upstream integration and profile catalogue fix at `f5739da0db70` |
 
 `origin` points to the fork and `upstream` to the original repository. Use `spark`
 as the fork's default branch. Keep released tags fixed and merge shared branches
@@ -27,9 +28,15 @@ their results and retained changes have been recorded.
 The initial `spark` source was reconstructed into focused commits. At
 `3c9849451615ba771a4936a231b71cd1ceb5e2dd`, its complete Git tree is identical to
 the tested `d44bebb612051a9581803479e6ec456c2e5c62ae`:
-`46bce6549067d59f60c99c2aa025416b05704ffa`. Subsequent fork setup adds only
+`46bce6549067d59f60c99c2aa025416b05704ffa`. The initial fork setup then added
 documentation and a deployment example. Rebuilding a new commit changes the
 reported version; this does not retag or replace the already validated binary.
+
+Release `spark-2026.09.26.2` incorporates upstream PR #54 and serves as
+`0.1.0+gf5739da0db70`. It keeps the initial engine settings and checkpoint history
+defaults. See [the integration record](benchmarks/results/2026-09-26-spark-upstream-history.md)
+for native checks, live request comparisons, the template-name correction and
+the new history-control checks.
 
 ## Retained differences
 
