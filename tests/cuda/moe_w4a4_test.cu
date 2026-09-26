@@ -158,8 +158,8 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_exact, const
 
   auto w4a4 = [&] {
     launch_quantize_rows_nvfp4(act, k, tokens, k, codes, scales, gs, nullptr, static_gs);
-    launch_moe_grouped_w4a4_f32(codes, scales, gs, act_rows, segs, ns, c.max_rows, d.views, 0, out4, n, n, k,
-                                nullptr);
+    launch_moe_grouped_w4a4_f32(codes, scales, gs, act_rows, segs, ns, tokens, d.views, 0, out4, n, n, k,
+                                nullptr, rows);
   };
   auto w4a16 = [&] {
     launch_moe_grouped_mma_fp4_f32(act, k, segs, ns, c.max_rows, 0, d.views, 0, out16, n, n, k, nullptr, act_rows);
@@ -241,11 +241,11 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_exact, const
               label, rows, n, k, t16, flop / t16 / 1e9, t4, flop / t4 / 1e9, tq, t16 / t4);
   // The production output form (bf16 rows, the down projection's down_bf16_).
   auto gemm_bf16 = [&] {
-    launch_moe_grouped_w4a4_bf16(codes, scales, gs, act_rows, segs, ns, c.max_rows, d.views, 0,
-                                 reinterpret_cast<uint16_t*>(out4), n, n, k, nullptr);
+    launch_moe_grouped_w4a4_bf16(codes, scales, gs, act_rows, segs, ns, tokens, d.views, 0,
+                                 reinterpret_cast<uint16_t*>(out4), n, n, k, nullptr, rows);
   };
   auto gemm_f32 = [&] {
-    launch_moe_grouped_w4a4_f32(codes, scales, gs, act_rows, segs, ns, c.max_rows, d.views, 0, out4, n, n, k, nullptr);
+    launch_moe_grouped_w4a4_f32(codes, scales, gs, act_rows, segs, ns, tokens, d.views, 0, out4, n, n, k, nullptr, rows);
   };
   const float tb = time(gemm_bf16), tf = time(gemm_f32);
   std::printf("[ .. ] %s GEMM only: f32 out %.3f ms (%.1f TF), bf16 out %.3f ms (%.1f TF)\n", label, tf,
@@ -292,6 +292,7 @@ int main(int argc, char** argv) {
   // Empty segments and hot experts crossing several row tiles, including
   // both row/column tails and K=320's partial final pipeline stage.
   fails += run(13, 32, 1, 130, 320, true, "empty-segments");
+  fails += run(512, 1, 1, 130, 320, true, "exact-tile-hot-expert");
   fails += run(513, 1, 1, 130, 320, true, "hot-expert");
   fails += run(385, 4, 4, 256, 256, true, "all-hot-experts");
   // Prefill shapes (the Qwen experts per rank at TP=2: gate/up n = 320,

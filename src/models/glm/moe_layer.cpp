@@ -756,7 +756,7 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                          routed_arg ? routed_bits : shared_bits, stream);
     else if (w4a4 && routed_arg)
       launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, d_rows_, sg, ns, mr, d_views_prefill_, which, out,
-                                   I_max, n, H, stream);
+                                   I_max, n, H, stream, tokens * cfg_.top_k);
     else if (mma && routed && fp4)
       launch_moe_grouped_mma_fp4_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_,
                                       which, out, I_max, n, H, stream, d_rows_, fp4_group);
@@ -782,10 +782,10 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                         routed_arg ? routed_bits : shared_bits, stream);
     else if (w4a4 && routed_arg && down_bf16_)
       launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2,
-                                   reinterpret_cast<uint16_t*>(d_down_), H, H, k, stream);
+                                   reinterpret_cast<uint16_t*>(d_down_), H, H, k, stream, tokens * cfg_.top_k);
     else if (w4a4 && routed_arg)
       launch_moe_grouped_w4a4_f32(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H,
-                                  k, stream);
+                                  k, stream, tokens * cfg_.top_k);
     else if (mma && routed && fp4)
       launch_moe_grouped_mma_fp4_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
                                      2, d_down_, H, H, k, stream, nullptr, fp4_group);

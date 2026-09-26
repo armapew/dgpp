@@ -438,7 +438,7 @@ DGPP_TEST(qwen_engines_world_of_one_four_slots_compact_fp8_head) {
   qwenfx::write_fixture(cfg, dir);
   std::vector<std::vector<int64_t>> prompts;
   for (int i = 0; i < 4; ++i) prompts.push_back(smoke_tokens(cfg, 17 + i * 4, 0xAB00 + i));
-  for (int depth : {1, 2, 3}) {
+  for (int depth : {1, 2, 3, 4, 5}) {
     auto buses = start_world(1, kPort + 21);
     require(buses.size() == 1, "world-of-one four-slot bus");
     const int rows = 4 * (depth + 1);
