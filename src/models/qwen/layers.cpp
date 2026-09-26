@@ -605,7 +605,8 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
   // Score every row's visible pools, select, attend.
   qsa_index_score(qi_, static_cast<int64_t>(idx_heads_) * Di, d_req, d_pos, T, cache.block_tables,
                   cache.blocks_per_request, cache.index_cache, pools_per_block, idx_heads_, Di, kpool_,
-                  keys_ws_, max_pools_, stream);
+                  keys_ws_, max_pools_, stream,
+                  rows.decode ? -1 : (rows.pos0 + T) / kpool_);
   qsa_select_from_keys(keys_ws_, max_pools_, d_pos, T, select_k_, kpool_, max_selected_, topk_,
                        counts_, stream);
   // Small grids do not amortize the wider head group. Keep decode/verify and
