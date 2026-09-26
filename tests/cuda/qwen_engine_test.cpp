@@ -287,7 +287,9 @@ void rank_work_mtp(int r, const QwenTextConfig& cfg, const std::string& dir, con
     BusBoundaryReducer reducer(*bus, wait_timeout_ms());
     auto* boundary = world > 1 ? &reducer : nullptr;
     QwenModel eager(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, boundary, r, world, kSlots);
-    QwenModel mtp(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, boundary, r, world, kSlots, /*mtp=*/true);
+    QwenModel mtp(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, boundary, r, world, kSlots,
+                  /*mtp=*/true, /*decode_rows=*/depth > 2 ? kSlots * (1 + depth) : 0, /*fp8_head_mma=*/false,
+                  /*serving_logits=*/true);
     DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
                                sizeof(uint16_t) * dgpp::kPickScratchElems(world), cudaHostAllocDefault));
     arrive_once();
@@ -400,7 +402,7 @@ DGPP_TEST(qwen_engines_world_of_one_mtp_graph_matches_plain_decode) {
     bool first = true;
     for (bool mapped : {false, true}) {
       dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
-      for (int depth : {1, 2}) {
+      for (int depth : {1, 2, 3}) {
         auto buses = start_world(1, kPort + 20);
         require(buses.size() == 1, "world-of-one bus failed to start");
         ConstructBarrier barrier(1);
@@ -417,6 +419,64 @@ DGPP_TEST(qwen_engines_world_of_one_mtp_graph_matches_plain_decode) {
                 "world-of-one mapped table or draft depth changes the transcript");
       }
     }
+  }
+}
+
+DGPP_TEST(qwen_engines_world_of_one_four_slots_compact_fp8_head) {
+  struct RestoreModes {
+    bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
+    bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();
+    ~RestoreModes() {
+      dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
+      dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
+    }
+  } restore;
+  dgpp::QwenLayerStream::set_dense_weights_fp8(true);
+  dgpp::QwenLayerStream::set_ngram_table_mmap(true);
+  const auto cfg = qwenfx::tiny_config();
+  const std::string dir = "qwen_engine_world1_four_fixture";
+  qwenfx::write_fixture(cfg, dir);
+  std::vector<std::vector<int64_t>> prompts;
+  for (int i = 0; i < 4; ++i) prompts.push_back(smoke_tokens(cfg, 17 + i * 4, 0xAB00 + i));
+  for (int depth : {1, 2, 3}) {
+    auto buses = start_world(1, kPort + 21);
+    require(buses.size() == 1, "world-of-one four-slot bus");
+    const int rows = 4 * (depth + 1);
+    QwenModel eager(cfg, dir, 128, 1024, QwenResidency::Resident, nullptr, 0, 1, 4,
+                    false, rows, true, false);
+    QwenModel model(cfg, dir, 128, 1024, QwenResidency::Resident, nullptr, 0, 1, 4,
+                    true, rows, true, true);
+    EagerEngineAdapter<QwenModel> plain(&eager, 4, dgpp::make_w1_pick(cfg.vocab_size));
+    std::vector<std::vector<int32_t>> expected;
+    for (int i = 0; i < 4; ++i) expected.push_back(solo(plain, i, prompts[i], 24));
+    uint16_t* scratch = nullptr;
+    DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
+                               sizeof(uint16_t) * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
+    {
+      GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
+          cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 0, nullptr, 0, depth, false);
+      std::vector<std::vector<int32_t>> actual(4);
+      for (int i = 0; i < 4; ++i) {
+        actual[i].push_back(graph.prefill(i, prompts[i]));
+        graph.reserve(i, prompts[i].size() + 32 + depth);
+      }
+      bool complete = false;
+      while (!complete) {
+        const auto tokens = graph.step_batch({0, 1, 2, 3});
+        complete = true;
+        for (int i = 0; i < 4; ++i) {
+          actual[i].insert(actual[i].end(), tokens[i].begin(), tokens[i].end());
+          complete &= actual[i].size() >= expected[i].size();
+        }
+      }
+      for (int i = 0; i < 4; ++i) {
+        actual[i].resize(expected[i].size());
+        require(actual[i] == expected[i], "four-slot compact FP8/MMA head differs from eager, depth " + std::to_string(depth));
+        graph.close(i);
+      }
+      graph.drain();
+    }
+    cudaFreeHost(scratch);
   }
 }
 
