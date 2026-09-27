@@ -471,6 +471,9 @@ QwenQsaLayer::QwenQsaLayer(const QwenQsaResident& w, const QwenGemmWorkspace& ge
   if (idx_dim_ != 128 || idx_heads_ < 1 || idx_heads_ > 4 || cfg.indexer_kv_heads != 1)
     throw std::invalid_argument("QwenQsaLayer: indexer <= 4 heads x 128, one key head");
   if (max_pools_ <= 0) throw std::invalid_argument("QwenQsaLayer: max_pools must be positive");
+  if (const char* tile = std::getenv("DGPP_QSA_QUERY_TILE")) query_tile_ = std::atoi(tile);
+  if (query_tile_ != 1 && query_tile_ != 2 && query_tile_ != 4 && query_tile_ != 8)
+    throw std::invalid_argument("QwenQsaLayer: DGPP_QSA_QUERY_TILE must be 1, 2, 4 or 8");
   scale_ = static_cast<float>(std::pow(static_cast<double>(dim_), -0.5));
   std::vector<float> inv(static_cast<size_t>(rotary_ / 2));
   // The rope table: the plain one, or the YaRN ramp the engine knob asks
@@ -607,7 +610,7 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
   qsa_index_score(qi_, static_cast<int64_t>(idx_heads_) * Di, d_req, d_pos, T, cache.block_tables,
                   cache.blocks_per_request, cache.index_cache, pools_per_block, idx_heads_, Di, kpool_,
                   keys_ws_, max_pools_, stream,
-                  rows.decode ? -1 : (rows.pos0 + T) / kpool_);
+                  rows.decode ? -1 : (rows.pos0 + T) / kpool_, rows.decode ? 1 : query_tile_);
   qsa_select_from_keys(keys_ws_, max_pools_, d_pos, T, select_k_, kpool_, max_selected_, topk_,
                        counts_, stream);
   // Small grids do not amortize the wider head group. Keep decode/verify and

@@ -222,6 +222,7 @@ class QwenQsaLayer {
   int hidden_, lh_, lkv_, dim_, rotary_, idx_heads_, idx_dim_, kpool_, select_k_, max_selected_;
   int max_tokens_;
   int64_t max_pools_;
+  int query_tile_ = 1;
   float eps_, scale_;
   // The YaRN attention factor the cos/sin are built with (1.0f off the
   // knob): vLLM bakes mscale into its cos/sin cache, its softmax scale

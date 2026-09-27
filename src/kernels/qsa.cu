@@ -280,6 +280,114 @@ __global__ __launch_bounds__(kScoreThreads) void index_score_kernel(
   }
 }
 
+// Several neighboring queries can share an index-key load and conversion.
+// Each query keeps the scalar kernel's FMA chain and reduction tree. Tiles
+// crossing request boundaries use independent loads; positions remain per row.
+template <int Queries>
+__global__ __launch_bounds__(kScoreThreads) void index_score_query_tile_kernel(
+    const uint16_t* __restrict__ q, int64_t q_row_stride, const int32_t* __restrict__ req_ids,
+    const int64_t* __restrict__ pos, int rows, const int32_t* __restrict__ block_tables,
+    int blocks_per_request, const uint16_t* __restrict__ index_cache, int pools_per_block,
+    int heads, int kpool, uint64_t* __restrict__ keys_ws, int64_t ws_stride, float sqrt_dim) {
+  __shared__ float qs[Queries * 4 * 128];
+  const int r0 = static_cast<int>(blockIdx.y) * Queries;
+  int64_t visible[Queries], max_visible = 0;
+  int requests[Queries], shared_request = -1;
+  bool same_request = true;
+#pragma unroll
+  for (int i = 0; i < Queries; ++i) {
+    const int r = r0 + i;
+    const int64_t p = r < rows ? pos[r] : -1;
+    visible[i] = p < 0 ? 0 : (p + 1) / kpool;
+    requests[i] = p < 0 ? -1 : req_ids[r];
+    max_visible = max(max_visible, visible[i]);
+    if (visible[i] > 0) {
+      if (shared_request < 0) shared_request = requests[i];
+      else same_request &= shared_request == requests[i];
+    }
+  }
+  const int64_t p0 = static_cast<int64_t>(blockIdx.x) * kScorePoolsPerBlock;
+  if (p0 >= max_visible) return;
+  for (int x = threadIdx.x; x < Queries * 4 * 128; x += kScoreThreads) {
+    const int i = x / (4 * 128), d = x % (4 * 128);
+    qs[x] = visible[i] > 0 && d < heads * 128
+                ? bf16_bits_to_float(q[static_cast<int64_t>(r0 + i) * q_row_stride + d]) : 0.f;
+  }
+  __syncthreads();
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int h = lane >> 3, c = lane & 7;
+  if (same_request) {
+    const int32_t* bt = block_tables + static_cast<int64_t>(shared_request) * blocks_per_request;
+    const int64_t p1 = min(max_visible, p0 + kScorePoolsPerBlock);
+    for (int64_t pool = p0 + warp; pool < p1; pool += kScoreWarps) {
+      const int32_t blk = bt[pool / pools_per_block];
+      const int64_t slot = static_cast<int64_t>(blk) * pools_per_block + pool % pools_per_block;
+      const uint16_t* krow = index_cache + slot * 128 + c * 16;
+      const uint4 k0 = reinterpret_cast<const uint4*>(krow)[0];
+      const uint4 k1 = reinterpret_cast<const uint4*>(krow)[1];
+      const uint32_t kw[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+      float partial[Queries] = {};
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float2 kf = bf16x2_to_float2_q(kw[j]);
+#pragma unroll
+        for (int i = 0; i < Queries; ++i) {
+          const float* qr = qs + i * 4 * 128 + h * 128 + c * 16;
+          partial[i] = __fmaf_rn(qr[2 * j], kf.x, partial[i]);
+          partial[i] = __fmaf_rn(qr[2 * j + 1], kf.y, partial[i]);
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < Queries; ++i) {
+        float v = partial[i];
+        v = __fadd_rn(v, __shfl_xor_sync(~0u, v, 1));
+        v = __fadd_rn(v, __shfl_xor_sync(~0u, v, 2));
+        v = __fadd_rn(v, __shfl_xor_sync(~0u, v, 4));
+        v = fmaxf(v, 0.f);
+        v = __fadd_rn(v, __shfl_xor_sync(~0u, v, 8));
+        v = __fadd_rn(v, __shfl_xor_sync(~0u, v, 16));
+        const float score = __fdiv_rn(v, sqrt_dim);
+        if (lane == 0 && pool < visible[i])
+          keys_ws[static_cast<int64_t>(r0 + i) * ws_stride + pool] =
+              (static_cast<uint64_t>(~sortable_f32_dev(score)) << kIdxBits) | static_cast<uint64_t>(pool);
+      }
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < Queries; ++i) {
+      if (p0 >= visible[i]) continue;
+      const int32_t* bt = block_tables + static_cast<int64_t>(requests[i]) * blocks_per_request;
+      const int64_t p1 = min(visible[i], p0 + kScorePoolsPerBlock);
+      const float* qr = qs + i * 4 * 128 + h * 128 + c * 16;
+      for (int64_t pool = p0 + warp; pool < p1; pool += kScoreWarps) {
+        const int32_t blk = bt[pool / pools_per_block];
+        const int64_t slot = static_cast<int64_t>(blk) * pools_per_block + pool % pools_per_block;
+        const uint16_t* krow = index_cache + slot * 128 + c * 16;
+        const uint4 k0 = reinterpret_cast<const uint4*>(krow)[0];
+        const uint4 k1 = reinterpret_cast<const uint4*>(krow)[1];
+        const uint32_t kw[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+        float v = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const float2 kf = bf16x2_to_float2_q(kw[j]);
+          v = __fmaf_rn(qr[2 * j], kf.x, v);
+          v = __fmaf_rn(qr[2 * j + 1], kf.y, v);
+        }
+        v = __fadd_rn(v, __shfl_xor_sync(~0u, v, 1));
+        v = __fadd_rn(v, __shfl_xor_sync(~0u, v, 2));
+        v = __fadd_rn(v, __shfl_xor_sync(~0u, v, 4));
+        v = fmaxf(v, 0.f);
+        v = __fadd_rn(v, __shfl_xor_sync(~0u, v, 8));
+        v = __fadd_rn(v, __shfl_xor_sync(~0u, v, 16));
+        const float score = __fdiv_rn(v, sqrt_dim);
+        if (lane == 0)
+          keys_ws[static_cast<int64_t>(r0 + i) * ws_stride + pool] =
+              (static_cast<uint64_t>(~sortable_f32_dev(score)) << kIdxBits) | static_cast<uint64_t>(pool);
+      }
+    }
+  }
+}
+
 struct KeysRowFn {
   static constexpr bool kWarpCooperative = false;
   const uint64_t* keys;
@@ -667,7 +775,7 @@ void qsa_index_score(const uint16_t* q, int64_t q_row_stride, const int32_t* req
                      const int64_t* pos, int rows, const int32_t* block_tables,
                      int blocks_per_request, const uint16_t* index_cache, int pools_per_block,
                      int heads, int dim, int kpool, uint64_t* keys_ws, int64_t ws_stride,
-                     cudaStream_t stream, int64_t visible_pool_bound) {
+                     cudaStream_t stream, int64_t visible_pool_bound, int query_tile) {
   if (rows <= 0) return;
   if (!q || !req_ids || !pos || !block_tables || !index_cache || !keys_ws)
     throw std::invalid_argument("qsa_index_score: null pointer");
@@ -678,14 +786,31 @@ void qsa_index_score(const uint16_t* q, int64_t q_row_stride, const int32_t* req
   if (visible_pool_bound < -1 || visible_pool_bound > ws_stride)
     throw std::invalid_argument("qsa_index_score: visible pool bound outside workspace");
   if (rows > 65535) throw std::invalid_argument("qsa_index_score: too many rows per launch");
+  if (query_tile != 1 && query_tile != 2 && query_tile != 4 && query_tile != 8)
+    throw std::invalid_argument("qsa_index_score: query_tile must be 1, 2, 4 or 8");
   const int64_t pools = visible_pool_bound < 0 ? ws_stride : visible_pool_bound;
   if (pools == 0) return;
   const int64_t stripes = (pools + kScorePoolsPerBlock - 1) / kScorePoolsPerBlock;
   if (stripes > 0x7fffffff) throw std::invalid_argument("qsa_index_score: too many pools");
-  const dim3 grid(static_cast<unsigned>(stripes), static_cast<unsigned>(rows));
-  index_score_kernel<<<grid, kScoreThreads, 0, stream>>>(
-      q, q_row_stride, req_ids, pos, block_tables, blocks_per_request, index_cache,
-      pools_per_block, heads, kpool, keys_ws, ws_stride, std::sqrt(static_cast<float>(dim)));
+  const dim3 grid(static_cast<unsigned>(stripes), static_cast<unsigned>((rows + query_tile - 1) / query_tile));
+  const float sqrt_dim = std::sqrt(static_cast<float>(dim));
+  if (query_tile == 1) {
+    index_score_kernel<<<grid, kScoreThreads, 0, stream>>>(
+        q, q_row_stride, req_ids, pos, block_tables, blocks_per_request, index_cache,
+        pools_per_block, heads, kpool, keys_ws, ws_stride, sqrt_dim);
+  } else if (query_tile == 2) {
+    index_score_query_tile_kernel<2><<<grid, kScoreThreads, 0, stream>>>(
+        q, q_row_stride, req_ids, pos, rows, block_tables, blocks_per_request, index_cache,
+        pools_per_block, heads, kpool, keys_ws, ws_stride, sqrt_dim);
+  } else if (query_tile == 4) {
+    index_score_query_tile_kernel<4><<<grid, kScoreThreads, 0, stream>>>(
+        q, q_row_stride, req_ids, pos, rows, block_tables, blocks_per_request, index_cache,
+        pools_per_block, heads, kpool, keys_ws, ws_stride, sqrt_dim);
+  } else {
+    index_score_query_tile_kernel<8><<<grid, kScoreThreads, 0, stream>>>(
+        q, q_row_stride, req_ids, pos, rows, block_tables, blocks_per_request, index_cache,
+        pools_per_block, heads, kpool, keys_ws, ws_stride, sqrt_dim);
+  }
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

@@ -572,6 +572,87 @@ DGPP_TEST(qsa_request_bounded_workspace_preserves_scores_selection_and_graphs) {
   }
 }
 
+DGPP_TEST(qsa_query_tiles_preserve_keys_selections_and_graph_replay) {
+  constexpr int dim = 128, ppb = 16, kpool = 4, select_k = 512;
+  constexpr int requests = 3, guard = 16, width = select_k * kpool + kpool - 1;
+  constexpr int qstride = 4 * dim + 8;
+  cudaStream_t stream = test_stream();
+  for (int context : {2053, 100003, 200003, 524287}) {
+    const int rows = context == 2053 ? 4099 : 19;
+    const int visible_max = context / kpool;
+    const int stride = visible_max + 7;
+    const int blocks = (stride + ppb - 1) / ppb;
+    std::vector<int32_t> table(requests * blocks);
+    std::iota(table.begin(), table.end(), 0);
+    std::mt19937 rng(48028);
+    std::shuffle(table.begin(), table.end(), rng);
+    const auto cache = random_bf16_normal(602, int64_t(requests) * blocks * ppb * dim, 1.f);
+    const auto queries = random_bf16_normal(603, int64_t(rows) * qstride, 1.f);
+    DevBuf dc = up(cache), dq = up(queries), dt = up(table);
+    DevBuf dp(rows * sizeof(int64_t)), dr(rows * sizeof(int32_t));
+    const size_t nkeys = size_t(rows) * stride + 2 * guard;
+    struct Result {
+      std::vector<uint64_t> keys;
+      std::vector<int32_t> selected, counts;
+    };
+    for (int heads : {1, 4}) {
+      DevBuf keys(nkeys * sizeof(uint64_t));
+      DevBuf selected(size_t(rows) * width * sizeof(int32_t)), counts(rows * sizeof(int32_t));
+      const auto launch = [&](int tile) {
+        DGPP_CUDA_OK(cudaMemsetAsync(keys.p, 0xa5, keys.bytes, stream));
+        dgpp::qsa_index_score(ptr<uint16_t>(dq), qstride, ptr<int32_t>(dr), ptr<int64_t>(dp),
+            rows, ptr<int32_t>(dt), blocks, ptr<uint16_t>(dc), ppb, heads, dim, kpool,
+            mptr<uint64_t>(keys) + guard, stride, stream, visible_max, tile);
+        dgpp::qsa_select_from_keys(ptr<uint64_t>(keys) + guard, stride, ptr<int64_t>(dp),
+            rows, select_k, kpool, width, mptr<int32_t>(selected), mptr<int32_t>(counts), stream);
+      };
+      const auto result = [&] {
+        DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        return Result{down<uint64_t>(keys, nkeys), down<int32_t>(selected, size_t(rows) * width),
+                      down<int32_t>(counts, rows)};
+      };
+      for (int tile : {2, 4, 8}) {
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        launch(tile);
+        DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+        DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (int pattern = 0; pattern < 3; ++pattern) {
+          std::vector<int64_t> pos(rows);
+          std::vector<int32_t> req(rows);
+          for (int r = 0; r < rows; ++r) {
+            // Cold and long suffixes, request-boundary tiles, ragged tail,
+            // empty visibility and inactive rows below one captured shape.
+            pos[r] = context - rows + r;
+            if (context == 2053) pos[r] = r % context;
+            req[r] = pattern == 0 ? 1 : (r / (pattern == 1 ? 7 : 1)) % requests;
+            if (pattern > 0 && r % 7 == 0) pos[r] = -1;
+            else if (pattern == 2 && r % 5 == 0) pos[r] = r % 4;
+            if (pos[r] < 0) req[r] = -1;
+          }
+          dp.upload(pos.data(), pos.size() * sizeof(int64_t));
+          dr.upload(req.data(), req.size() * sizeof(int32_t));
+          launch(1);
+          const auto reference = result();
+          launch(tile);
+          auto got = result();
+          require(got.keys == reference.keys && got.selected == reference.selected &&
+                      got.counts == reference.counts, "query tile changed eager scores, selection or guards");
+          DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+          got = result();
+          require(got.keys == reference.keys && got.selected == reference.selected &&
+                      got.counts == reference.counts, "query tile changed graph scores, selection or guards");
+        }
+        DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
+        DGPP_CUDA_OK(cudaGraphDestroy(graph));
+      }
+    }
+    std::printf("[ .. ] query tiles 2/4/8, %d rows at context %d: scores, selections and graphs exact\n",
+                rows, context);
+  }
+}
+
 DGPP_TEST(qsa_visible_pool_bound_handles_empty_context_and_invalid_bounds) {
   SelectFixture sf(20260926);
   const Geo& g = sf.f.g;
