@@ -505,7 +505,7 @@ DGPP_TEST(qsa_request_bounded_workspace_preserves_scores_selection_and_graphs) {
       std::vector<uint64_t> keys;
       std::vector<int32_t> selected, counts;
     };
-    const auto calculate = [&](int stride, bool replay_graph) {
+    const auto calculate = [&](int stride, bool replay_graph, int64_t visible_pool_bound = -1) {
       const size_t nkeys = size_t(rows) * stride;
       DevBuf keys((nkeys + 2 * guard) * sizeof(uint64_t));
       DevBuf selected(size_t(rows) * width * sizeof(int32_t)), counts(rows * sizeof(int32_t));
@@ -514,7 +514,7 @@ DGPP_TEST(qsa_request_bounded_workspace_preserves_scores_selection_and_graphs) {
         dgpp::qsa_index_score(ptr<uint16_t>(dq), heads * dim, ptr<int32_t>(dr),
                              ptr<int64_t>(dp), rows, ptr<int32_t>(dt), blocks,
                              ptr<uint16_t>(dc), ppb, heads, dim, kpool,
-                             mptr<uint64_t>(keys) + guard, stride, stream);
+                             mptr<uint64_t>(keys) + guard, stride, stream, visible_pool_bound);
         dgpp::qsa_select_from_keys(ptr<uint64_t>(keys) + guard, stride, ptr<int64_t>(dp),
                                   rows, select_k, kpool, width, mptr<int32_t>(selected),
                                   mptr<int32_t>(counts), stream);
@@ -555,6 +555,10 @@ DGPP_TEST(qsa_request_bounded_workspace_preserves_scores_selection_and_graphs) {
       return result;
     };
     const auto reference = calculate(wide, false);
+    const auto capped = calculate(wide, true, context / kpool);
+    require(reference.keys == capped.keys && reference.selected == capped.selected &&
+                reference.counts == capped.counts,
+            "visible-pool launch bound changed scores, selection or guards");
     const auto bounded = calculate(compact, true);
     require(reference.selected == bounded.selected && reference.counts == bounded.counts,
             "request-bounded workspace changed selected tokens");
@@ -565,6 +569,36 @@ DGPP_TEST(qsa_request_bounded_workspace_preserves_scores_selection_and_graphs) {
                 "request-bounded workspace changed scoring keys");
     std::printf("[ .. ] %d rows, context %d, stride %d -> %d: keys, selection and graphs exact\n",
                 rows, context, wide, compact);
+  }
+}
+
+DGPP_TEST(qsa_visible_pool_bound_handles_empty_context_and_invalid_bounds) {
+  SelectFixture sf(20260926);
+  const Geo& g = sf.f.g;
+  cudaStream_t stream = test_stream();
+  constexpr int64_t stride = 4096;
+  const auto score = [&](int64_t bound) {
+    const size_t count = static_cast<size_t>(sf.rows()) * stride;
+    DevBuf keys(count * sizeof(uint64_t));
+    DGPP_CUDA_OK(cudaMemsetAsync(keys.p, 0xff, keys.bytes, stream));
+    dgpp::qsa_index_score(ptr<uint16_t>(sf.dq), int64_t(g.idx_heads) * g.idx_dim,
+                          ptr<int32_t>(sf.dreq), ptr<int64_t>(sf.dpos), sf.rows(),
+                          ptr<int32_t>(sf.f.dtable), g.blocks_per_request,
+                          ptr<uint16_t>(sf.dcache), g.pools_per_block(), g.idx_heads,
+                          g.idx_dim, g.kpool, mptr<uint64_t>(keys), stride, stream, bound);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    return down<uint64_t>(keys, count);
+  };
+  // No complete compressed key exists yet; selection uses the incomplete tail.
+  sf.pos.assign(static_cast<size_t>(sf.rows()), g.kpool - 2);
+  sf.pos.back() = -1;
+  sf.dpos.upload(sf.pos.data(), sf.pos.size() * sizeof(int64_t));
+  require(score(-1) == score(0), "zero-visible launch changed untouched keys");
+  for (int64_t invalid : {int64_t{-2}, stride + 1}) {
+    bool threw = false;
+    try { (void)score(invalid); }
+    catch (const std::invalid_argument&) { threw = true; }
+    require(threw, "invalid visible bound accepted");
   }
 }
 
