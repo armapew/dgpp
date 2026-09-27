@@ -1,5 +1,9 @@
 # DGPP
 
+This is the Spark maintenance branch. See [FORK.md](FORK.md) for the accepted
+baseline, deployment profile and update workflow. `spark-2026.09.28.1` pins the
+exact source of the deployed release.
+
 DGPP is a C++/CUDA inference engine for NVIDIA DGX Spark (GB10) systems.
 It serves GLM-5.3-Flash, full GLM-5.3, Qwen3.8-Flash-Next, GLM-4.7 and
 DeepSeek-V4.1-Flash through an OpenAI-compatible HTTP API, with tensor
