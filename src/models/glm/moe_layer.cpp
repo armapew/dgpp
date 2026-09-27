@@ -49,7 +49,7 @@ size_t GlmMoeLayer::scratch_bytes(const GlmMoeConfig& cfg, int max_tokens,
   dev += M * H * 4;                  // d_acc_
   if (decode_slots > 0) {
     const size_t rows = static_cast<size_t>(decode_slots) * (K + 1);
-    dev += rows * I * 2 + rows * H * 4 + rows * 4;
+    dev += rows * I * 2 + rows * H * 4 + rows * 8;
     dev += static_cast<size_t>(decode_slots) * sizeof(int);
     dev += sizeof(MoeExpertView) * (E + 1) * 3;
     if (graph_table_slots > 0) {
@@ -156,7 +156,7 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
         static_cast<size_t>(decode_slots_) * (cfg_.top_k + 1);
     DGPP_CUDA_OK(cudaMalloc(&d_slot_act_, rows * I * 2));
     DGPP_CUDA_OK(cudaMalloc(&d_slot_down_, rows * H * sizeof(float)));
-    DGPP_CUDA_OK(cudaMalloc(&d_slot_order_, rows * sizeof(int32_t)));
+    DGPP_CUDA_OK(cudaMalloc(&d_slot_order_, rows * 2 * sizeof(int32_t)));
     // The fused router selection's tickets: one per decode row, zero at
     // rest (the last block of each launch resets its own).
     DGPP_CUDA_OK(cudaMalloc(&d_router_counters_,
@@ -1016,8 +1016,13 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   // expert order so an expert two rows share is read from DRAM once (see
   // launch_moe_slot_order); one token has nothing to share.
   const int32_t* order = nullptr;
+  int32_t* reuse_counts = nullptr;
+  const char* reuse_mode = std::getenv("DGPP_FP4_GATE_REUSE");
+  const bool reuse = fp4 && !with_shared && w_.experts_fp4[0].scale_group == 16 &&
+                     (H == 2560 || H == 256) && (!reuse_mode || reuse_mode[0] != '0');
   if (tokens > 1) {
-    launch_moe_slot_order(d_ids_, d_slot_order_, slots, K, E, stream);
+    if (reuse) reuse_counts = d_slot_order_ + static_cast<size_t>(decode_slots_) * (K + 1);
+    launch_moe_slot_order(d_ids_, d_slot_order_, slots, K, E, stream, reuse_counts);
     order = d_slot_order_;
   }
   // Gate + up + swiglu in one launch (bit-identical to the three-launch
@@ -1043,7 +1048,7 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
     launch_moe_slot_gate_up_swiglu_fp4(
         hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,
         sh_up_p, sh_up_s, d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream,
-        shared_view_base, fp4_group, sh_rs, sh_cs);
+        shared_view_base, fp4_group, sh_rs, sh_cs, reuse_counts);
     launch_moe_slot_down_fp4(d_slot_act_, I_r, d_ids_, order, table, H, I_r, N_s,
                              I_s, sh_down_p, sh_down_s, d_slot_down_, H, slots, K,
                              stream, shared_view_base, fp4_group, sh_rs, sh_cs);

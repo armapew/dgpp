@@ -16,7 +16,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -1932,6 +1934,126 @@ DGPP_TEST(moe_w4a4_host_and_device_segmentation_match_both_output_formats) {
   }
   cudaFree(out);
   cudaFree(act_scales);
+  c.free_all();
+}
+
+DGPP_TEST(moe_nvfp4_gate_reuse_is_bitwise_and_graph_safe) {
+  constexpr int E = 64, H = 2560, I = 640, K = 10, M = 24, stride = I + 8;
+  SmallCase c = make_small_case(E, H, I, K, M, 0xF4AE05, true);
+  c.alloc();
+  int32_t *ids = nullptr, *order = nullptr, *counts = nullptr;
+  dgpp::MoeExpertView* views = nullptr;
+  uint16_t *ref = nullptr, *got = nullptr;
+  const size_t elems = static_cast<size_t>(M) * (K + 1) * stride + 16;
+  DGPP_CUDA_OK(cudaMallocManaged(&ids, M * K * 4));
+  DGPP_CUDA_OK(cudaMallocManaged(&order, M * (K + 1) * 4));
+  DGPP_CUDA_OK(cudaMallocManaged(&counts, M * (K + 1) * 4));
+  DGPP_CUDA_OK(cudaMallocManaged(&views, E * 3 * sizeof(*views)));
+  DGPP_CUDA_OK(cudaMallocManaged(&ref, elems * 2));
+  DGPP_CUDA_OK(cudaMallocManaged(&got, elems * 2));
+  for (int i = 0; i < E * 3; ++i) views[i] = dgpp::MoeExpertView::of(c.expert_mats_fp4[i]);
+  auto routes = [&](int rows, int pattern, unsigned seed) {
+    std::mt19937 rng(seed);
+    for (int t = 0; t < rows; ++t) {
+      std::vector<int> route;
+      if (pattern == 3) {
+        for (int e = 0; e < E; ++e) route.push_back(e);
+        std::shuffle(route.begin(), route.end(), rng);
+        route.resize(K);
+      } else {
+        const int base = pattern == 0 ? 0 : (pattern == 1 ? t / 2 : t) * K;
+        for (int j = 0; j < K; ++j) route.push_back((base + j) % E);
+      }
+      std::sort(route.begin(), route.end());
+      std::copy(route.begin(), route.end(), ids + t * K);
+    }
+  };
+  auto launch = [&](int rows, bool reuse, int width, cudaStream_t stream) {
+    const int slots = rows * (K + 1);
+    dgpp::launch_moe_slot_order(ids, order, slots, K, E, stream, reuse ? counts : nullptr);
+    dgpp::launch_moe_slot_gate_up_swiglu_fp4(
+        c.d_hidden, H, ids, order, views, width, H, 0, 0, nullptr, nullptr, nullptr,
+        nullptr, reuse ? got : ref, stride, slots, K,
+        std::numeric_limits<float>::infinity(), stream, -1, 16, 7, 7, reuse ? counts : nullptr);
+  };
+  cudaStream_t stream;
+  DGPP_CUDA_OK(cudaStreamCreate(&stream));
+  for (const int rows : {1, 2, 3, 4, 5, 8, 12, 24}) {
+    for (int pattern = 0; pattern < 4; ++pattern) {
+      routes(rows, pattern, 42);
+      DGPP_CUDA_OK(cudaMemset(ref, 0xA5, elems * 2));
+      DGPP_CUDA_OK(cudaMemset(got, 0xA5, elems * 2));
+      // Capture the planner too; the route IDs change between replays.
+      cudaGraph_t graph;
+      cudaGraphExec_t exec;
+      DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+      launch(rows, false, I - 3, stream);
+      launch(rows, true, I - 3, stream);
+      DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+      DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+      for (int repeat = 0; repeat < 2; ++repeat) {
+        routes(rows, (pattern + repeat) % 4, 42 + repeat);
+        DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+        DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        require(std::memcmp(ref, got, elems * 2) == 0,
+                "NVFP4 gate reuse changed a value, padding or inactive slot");
+        int covered = 0;
+        for (int s = 0; s < rows * (K + 1); ++s) covered += counts[s];
+        require(covered == rows * K, "reuse plan must cover every routed slot once");
+      }
+      DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
+      DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    }
+  }
+  std::printf("[ OK ] NVFP4 gate reuse: real widths, 1..24 rows, ragged outputs, routing changes and graph replay exact\n");
+  if (std::getenv("DGPP_BENCH_FP4_REUSE")) {
+    for (const int rows : {2, 4, 8, 12, 24}) {
+      for (int pattern = 0; pattern < 4; ++pattern) {
+        routes(rows, pattern, 314);
+        cudaGraphExec_t execs[2];
+        cudaGraph_t graphs[2];
+        for (int arm = 0; arm < 2; ++arm) {
+          DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+          launch(rows, arm == 1, I, stream);
+          DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graphs[arm]));
+          DGPP_CUDA_OK(cudaGraphInstantiate(&execs[arm], graphs[arm], nullptr, nullptr, 0));
+          for (int w = 0; w < 20; ++w) DGPP_CUDA_OK(cudaGraphLaunch(execs[arm], stream));
+          DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        }
+        cudaEvent_t start, stop;
+        DGPP_CUDA_OK(cudaEventCreate(&start));
+        DGPP_CUDA_OK(cudaEventCreate(&stop));
+        std::vector<float> times[2];
+        for (int repeat = 0; repeat < 7; ++repeat) {
+          for (int a = 0; a < 2; ++a) {
+            const int arm = a ^ (repeat % 2);
+            DGPP_CUDA_OK(cudaEventRecord(start, stream));
+            for (int it = 0; it < 200; ++it) DGPP_CUDA_OK(cudaGraphLaunch(execs[arm], stream));
+            DGPP_CUDA_OK(cudaEventRecord(stop, stream));
+            DGPP_CUDA_OK(cudaEventSynchronize(stop));
+            float ms = 0;
+            DGPP_CUDA_OK(cudaEventElapsedTime(&ms, start, stop));
+            times[arm].push_back(ms * 1000 / 200);
+          }
+        }
+        for (auto& v : times) std::sort(v.begin(), v.end());
+        require(std::memcmp(ref, got, static_cast<size_t>(rows) * (K + 1) * stride * 2) == 0,
+                "benchmark outputs must match");
+        int groups = 0;
+        for (int s = 0; s < rows * (K + 1); ++s) groups += counts[s] > 0;
+        std::printf("REUSE_BENCH {\"rows\":%d,\"pattern\":%d,\"slots\":%d,\"groups\":%d,\"baseline_us\":%.3f,\"candidate_us\":%.3f}\n",
+                    rows, pattern, rows * K, groups, times[0][3], times[1][3]);
+        for (int arm = 0; arm < 2; ++arm) {
+          DGPP_CUDA_OK(cudaGraphExecDestroy(execs[arm]));
+          DGPP_CUDA_OK(cudaGraphDestroy(graphs[arm]));
+        }
+        DGPP_CUDA_OK(cudaEventDestroy(start));
+        DGPP_CUDA_OK(cudaEventDestroy(stop));
+      }
+    }
+  }
+  DGPP_CUDA_OK(cudaStreamDestroy(stream));
+  cudaFree(ids); cudaFree(order); cudaFree(counts); cudaFree(views); cudaFree(ref); cudaFree(got);
   c.free_all();
 }
 

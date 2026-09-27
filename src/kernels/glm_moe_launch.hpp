@@ -187,7 +187,8 @@ void launch_moe_round_bf16(uint16_t* out, const float* acc, int64_t n,
 // so a shared expert's second read is an L2 hit. Null = identity. Results
 // are indexed by logical slot either way (bitwise identical).
 void launch_moe_slot_order(const int32_t* ids, int32_t* order, int slots,
-                           int top_k, int n_experts, cudaStream_t stream);
+                           int top_k, int n_experts, cudaStream_t stream,
+                           int32_t* reuse_counts = nullptr);
 void launch_moe_slot_gate_up_swiglu(
     const uint16_t* x, size_t x_stride, const int32_t* ids,
     const int32_t* order, const MoeExpertView* views, int n_routed,
@@ -318,7 +319,8 @@ void launch_moe_slot_gate_up_swiglu_fp4(
     const float* sh_gate_scales, const uint8_t* sh_up_payload,
     const float* sh_up_scales, uint16_t* act, int act_stride, int slots,
     int top_k, float limit, cudaStream_t stream, int shared_view_base = -1,
-    int fp4_group = 16, int sh_rs = 7, int sh_cs = 7);
+    int fp4_group = 16, int sh_rs = 7, int sh_cs = 7,
+    const int32_t* reuse_counts = nullptr);
 void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
                               const int32_t* ids, const int32_t* order,
                               const MoeExpertView* views, int n_routed,

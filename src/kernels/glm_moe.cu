@@ -438,7 +438,7 @@ __device__ __forceinline__ SlotMatrix resolve_slot_matrix(
 // block cost the 9216-block down launch +10 us, six times this kernel.)
 __global__ void moe_slot_order_kernel(const int32_t* __restrict__ ids,
                                       int32_t* __restrict__ order, int slots,
-                                      int top_k, int n_experts) {
+                                      int top_k, int n_experts, int32_t* reuse_counts) {
   extern __shared__ int32_t keys[];
   const int s = threadIdx.x;
   if (s < slots) {
@@ -452,6 +452,17 @@ __global__ void moe_slot_order_kernel(const int32_t* __restrict__ ids,
   for (int o = 0; o < slots; ++o)
     pos += (keys[o] < keys[s]) || (keys[o] == keys[s] && o < s);
   order[pos] = s;
+  if (reuse_counts) {
+    __syncthreads();
+    const int expert = keys[order[s]];
+    int first = s;
+    while (first > 0 && keys[order[first - 1]] == expert) --first;
+    int count = 0;
+    if (expert != n_experts && (s - first) % 4 == 0) {
+      while (count < 4 && s + count < slots && keys[order[s + count]] == expert) ++count;
+    }
+    reuse_counts[s] = count;
+  }
 }
 
 __device__ __forceinline__ int logical_slot(const int32_t* __restrict__ order) {
@@ -1544,14 +1555,15 @@ void check_slot_args(const void* x, const int32_t* ids,
 }  // namespace
 
 void launch_moe_slot_order(const int32_t* ids, int32_t* order, int slots,
-                           int top_k, int n_experts, cudaStream_t stream) {
+                           int top_k, int n_experts, cudaStream_t stream,
+                           int32_t* reuse_counts) {
   if (slots <= 0) return;
   if (!ids || !order) throw std::invalid_argument("moe_slot_order: null");
   if (slots > 1024)
     throw std::invalid_argument("moe_slot_order: more slots than one block");
   moe_slot_order_kernel<<<1, static_cast<unsigned>(slots),
                           static_cast<size_t>(slots) * sizeof(int32_t),
-                          stream>>>(ids, order, slots, top_k, n_experts);
+                          stream>>>(ids, order, slots, top_k, n_experts, reuse_counts);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -1786,6 +1798,80 @@ __global__ void moe_slot_gate_up_swiglu_fp4_kernel(
     u = fminf(fmaxf(u, -limit), limit);
     const uint16_t tt = float_to_bf16_bits(g * sigmoidf_acc(g));
     act_row[row] = float_to_bf16_bits(bf16_bits_to_float(tt) * u);
+  }
+}
+
+// Reuse an NVFP4 gate/up weight chunk across rows assigned to the same
+// expert. The core's FMA/reduction sequence is independent of row count.
+// Results still occupy their original logical slots for ordered accumulation.
+template <int K, int Rows>
+__device__ __forceinline__ void fp4_gate_reuse_rows(
+    const uint16_t* x, size_t x_stride, const int32_t* ids, const int32_t* order,
+    const MoeExpertView* views, uint16_t* sx, uint16_t* act, int act_stride,
+    int top_k, int n, float limit) {
+  using G = fp4_gemv::Geom<K>;
+  const int n0 = blockIdx.x * G::rows_per_block;
+  int slots[Rows];
+#pragma unroll
+  for (int r = 0; r < Rows; ++r) slots[r] = order[blockIdx.y + r];
+  const int slot = slots[0], token = slot / (top_k + 1), route = slot % (top_k + 1);
+  const int expert = ids[token * top_k + route];
+  const MoeExpertView vg = views[expert * 3], vu = views[expert * 3 + 1];
+  fp4_gemv::PassLoads<G::pass_chunks(0)> L0, L1;
+  fp4_gemv::issue_pass_pair<K, 0, G::pass_chunks(0), 16, kFp4SlotStreaming>(
+      vg.payload, vg.fp4_scales, vu.payload, vu.fp4_scales, n0, n, L0, L1);
+  if ((reinterpret_cast<uintptr_t>(x) & 15u) == 0 && x_stride % 8 == 0) {
+    for (int i = threadIdx.x; i < Rows * (K / 8); i += blockDim.x) {
+      const int r = i / (K / 8), c = i % (K / 8);
+      reinterpret_cast<uint4*>(sx + r * K)[c] =
+          reinterpret_cast<const uint4*>(x + static_cast<size_t>(slots[r] / (top_k + 1)) * x_stride)[c];
+    }
+  } else {
+    for (int i = threadIdx.x; i < Rows * K; i += blockDim.x) {
+      const int r = i / K, c = i % K;
+      sx[i] = x[static_cast<size_t>(slots[r] / (top_k + 1)) * x_stride + c];
+    }
+  }
+  __syncthreads();
+  float acc_g[fp4_gemv::kSteps][Rows], acc_u[fp4_gemv::kSteps][Rows];
+  fp4_gemv::warp_row_dots_pair_issued<K, Rows, 16, kFp4SlotStreaming>(
+      L0, L1, vg.payload, vg.fp4_scales, vu.payload, vu.fp4_scales, sx, n0, n, acc_g, acc_u);
+  const float gg = *vg.fp4_global, gu = *vu.fp4_global;
+#pragma unroll
+  for (int st = 0; st < fp4_gemv::kSteps; ++st) {
+    bool mine = false;
+    const int row = fp4_gemv::owned_row<K>(n0, st, mine);
+    if (!mine || row >= n) continue;
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) {
+      float g = bf16_bits_to_float(float_to_bf16_bits(__fdiv_rn(acc_g[st][r], gg)));
+      float u = bf16_bits_to_float(float_to_bf16_bits(__fdiv_rn(acc_u[st][r], gu)));
+      if (g > limit) g = limit;
+      u = fminf(fmaxf(u, -limit), limit);
+      const uint16_t tt = float_to_bf16_bits(g * sigmoidf_acc(g));
+      act[static_cast<size_t>(slots[r]) * act_stride + row] =
+          float_to_bf16_bits(bf16_bits_to_float(tt) * u);
+    }
+  }
+}
+
+template <int K, int MaxRows>
+__global__ void moe_slot_gate_up_fp4_reuse_kernel(
+    const uint16_t* x, size_t x_stride, const int32_t* ids, const int32_t* order,
+    const int32_t* reuse_counts, const MoeExpertView* views, uint16_t* act,
+    int act_stride, int top_k, int n, float limit) {
+  const int count = reuse_counts[blockIdx.y];
+  if (count == 0) return;
+  extern __shared__ __align__(16) uint16_t sx[];
+  if (count == 1)
+    fp4_gate_reuse_rows<K, 1>(x, x_stride, ids, order, views, sx, act, act_stride, top_k, n, limit);
+  else if (count == 2)
+    fp4_gate_reuse_rows<K, 2>(x, x_stride, ids, order, views, sx, act, act_stride, top_k, n, limit);
+  else if constexpr (MaxRows == 4) {
+    if (count == 3)
+      fp4_gate_reuse_rows<K, 3>(x, x_stride, ids, order, views, sx, act, act_stride, top_k, n, limit);
+    else
+      fp4_gate_reuse_rows<K, 4>(x, x_stride, ids, order, views, sx, act, act_stride, top_k, n, limit);
   }
 }
 
@@ -4086,7 +4172,7 @@ void launch_moe_slot_gate_up_swiglu_fp4(
     const float* sh_gate_scales, const uint8_t* sh_up_payload,
     const float* sh_up_scales, uint16_t* act, int act_stride, int slots,
     int top_k, float limit, cudaStream_t stream, int shared_view_base, int fp4_group,
-    int sh_rs, int sh_cs) {
+    int sh_rs, int sh_cs, const int32_t* reuse_counts) {
   if (slots <= 0) return;
   check_fp4_slot_args(x, ids, views, act, n_routed, k_routed, n_shared, k_shared,
                       shared_view_base, "moe_slot_gate_up_fp4", fp4_group);
@@ -4099,6 +4185,27 @@ void launch_moe_slot_gate_up_swiglu_fp4(
         "moe_slot_gate_up_fp4: shared payloads must be 16B-aligned with k % 16 == 0");
   if (act_stride < n_routed || act_stride < n_shared)
     throw std::invalid_argument("moe_slot_gate_up_fp4: act_stride below n");
+  if (reuse_counts) {
+    if (!order || n_shared != 0 || shared_fp4 || fp4_group != 16 ||
+        (k_routed != 256 && k_routed != 2560) || top_k <= 0 || slots % (top_k + 1) != 0)
+      throw std::invalid_argument("moe_slot_gate_up_fp4: reuse requires Qwen routed NVFP4 geometry and sorted slots");
+    const auto launch = [&](auto kc) {
+      constexpr int K = decltype(kc)::value;
+      const dim3 grid((n_routed + fp4_gemv::Geom<K>::rows_per_block - 1) /
+                         fp4_gemv::Geom<K>::rows_per_block, slots);
+      const int rows = std::min(4, slots / (top_k + 1));
+      if (rows <= 2)
+        moe_slot_gate_up_fp4_reuse_kernel<K, 2><<<grid, fp8_gemv::kThreads, rows * K * 2, stream>>>(
+            x, x_stride, ids, order, reuse_counts, views, act, act_stride, top_k, n_routed, limit);
+      else
+        moe_slot_gate_up_fp4_reuse_kernel<K, 4><<<grid, fp8_gemv::kThreads, rows * K * 2, stream>>>(
+            x, x_stride, ids, order, reuse_counts, views, act, act_stride, top_k, n_routed, limit);
+    };
+    if (k_routed == 2560) launch(std::integral_constant<int, 2560>{});
+    else launch(std::integral_constant<int, 256>{});
+    DGPP_CUDA_OK(cudaGetLastError());
+    return;
+  }
   const int max_n = n_routed > n_shared ? n_routed : n_shared;
   const int max_k = k_routed > k_shared ? k_routed : k_shared;
   const auto go = [&](auto kc, auto gc) {
