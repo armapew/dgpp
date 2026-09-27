@@ -1018,7 +1018,8 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   const int32_t* order = nullptr;
   int32_t* reuse_counts = nullptr;
   const char* reuse_mode = std::getenv("DGPP_FP4_GATE_REUSE");
-  const bool reuse = fp4 && !with_shared && w_.experts_fp4[0].scale_group == 16 &&
+  // Two-row verification regressed in the paired kernel screen; preserve C1 MTP-1.
+  const bool reuse = tokens > 2 && fp4 && !with_shared && w_.experts_fp4[0].scale_group == 16 &&
                      (H == 2560 || H == 256) && (!reuse_mode || reuse_mode[0] != '0');
   if (tokens > 1) {
     if (reuse) reuse_counts = d_slot_order_ + static_cast<size_t>(decode_slots_) * (K + 1);
