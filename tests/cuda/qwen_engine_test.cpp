@@ -578,30 +578,33 @@ DGPP_TEST(qwen_compact_logits_preserve_cache_concurrency_and_mtp) {
   }
 }
 
-DGPP_TEST(qwen_fp4_gate_reuse_preserves_cache_concurrency_and_mtp) {
+static void check_fp4_reuse_lifecycle(const char* env_key) {
   struct RestoreModes {
+    const char* key;
     bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();
     bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
-    bool had_env = std::getenv("DGPP_FP4_GATE_REUSE") != nullptr;
-    std::string old_env = had_env ? std::getenv("DGPP_FP4_GATE_REUSE") : "";
+    bool had_env;
+    std::string old_env;
+    explicit RestoreModes(const char* k)
+        : key(k), had_env(std::getenv(k) != nullptr), old_env(had_env ? std::getenv(k) : "") {}
     ~RestoreModes() {
-      if (had_env) setenv("DGPP_FP4_GATE_REUSE", old_env.c_str(), 1);
-      else unsetenv("DGPP_FP4_GATE_REUSE");
+      if (had_env) setenv(key, old_env.c_str(), 1);
+      else unsetenv(key);
       dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
       dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
     }
-  } restore;
+  } restore(env_key);
   dgpp::QwenLayerStream::set_ngram_table_mmap(true);
   dgpp::QwenLayerStream::set_dense_weights_fp8(true);
   const auto cfg = qwenfx::tiny_nvfp4_config();
-  const std::string dir = "qwen_fp4_gate_reuse_fixture";
+  const std::string dir = std::string("qwen_fp4_reuse_fixture_") + env_key;
   qwenfx::write_fixture(cfg, dir, qwenfx::tiny_text_json(), qwenfx::tiny_nvfp4_quant_json());
   const std::vector<int> limits{12, 28, 36, 44};
   std::vector<std::vector<int64_t>> prompts;
   for (int i = 0; i < 4; ++i) prompts.push_back(smoke_tokens(cfg, 17 + i * 8, 0xAB00 + i));
   for (int depth : {1, 2, 3, 4, 5}) {
     const auto run = [&](bool reuse) {
-      setenv("DGPP_FP4_GATE_REUSE", reuse ? "1" : "0", 1);
+      setenv(env_key, reuse ? "1" : "0", 1);
       auto buses = start_world(1, kPort + 24);
       require(buses.size() == 1, "expert reuse: world-of-one bus");
       const int rows = 4 * (depth + 1);
@@ -702,8 +705,18 @@ DGPP_TEST(qwen_fp4_gate_reuse_preserves_cache_concurrency_and_mtp) {
     };
     require(run(false) == run(true),
             "expert reuse changed graph/cache transcripts at MTP depth " + std::to_string(depth));
-    std::printf("[ .. ] expert reuse off/on: four slots, cache reuse, retirement and MTP depth %d exact\n", depth);
+    std::printf("[ .. ] %s off/on: four slots, cache reuse, retirement and MTP depth %d exact\n", env_key, depth);
   }
+}
+
+DGPP_TEST(qwen_fp4_gate_reuse_preserves_cache_concurrency_and_mtp) {
+  check_fp4_reuse_lifecycle("DGPP_FP4_GATE_REUSE");
+}
+
+DGPP_TEST(qwen_fp4_down_reuse_preserves_cache_concurrency_and_mtp) {
+  const char* gate = std::getenv("DGPP_FP4_GATE_REUSE");
+  require(!gate || gate[0] != '0', "down reuse check requires the existing gate grouping");
+  check_fp4_reuse_lifecycle("DGPP_FP4_DOWN_REUSE");
 }
 
 DGPP_TEST(qwen_engines_loopback_world_2_mtp_graph_matches_plain_decode) {

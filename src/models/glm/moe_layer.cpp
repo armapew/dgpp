@@ -1050,9 +1050,13 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
         hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,
         sh_up_p, sh_up_s, d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream,
         shared_view_base, fp4_group, sh_rs, sh_cs, reuse_counts);
+    const char* down_mode = std::getenv("DGPP_FP4_DOWN_REUSE");
+    const bool reuse_down = reuse_counts && (I_r == 640 || I_r == 64) &&
+                            (!down_mode || down_mode[0] != '0');
     launch_moe_slot_down_fp4(d_slot_act_, I_r, d_ids_, order, table, H, I_r, N_s,
                              I_s, sh_down_p, sh_down_s, d_slot_down_, H, slots, K,
-                             stream, shared_view_base, fp4_group, sh_rs, sh_cs);
+                             stream, shared_view_base, fp4_group, sh_rs, sh_cs,
+                             reuse_down ? reuse_counts : nullptr);
   } else {
     launch_moe_slot_gate_up_swiglu(
         hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,

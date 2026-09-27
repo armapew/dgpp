@@ -328,7 +328,8 @@ void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
                               const uint8_t* sh_payload, const float* sh_scales,
                               float* out, int out_stride, int slots, int top_k,
                               cudaStream_t stream, int shared_view_base = -1,
-                              int fp4_group = 16, int sh_rs = 7, int sh_cs = 7);
+                              int fp4_group = 16, int sh_rs = 7, int sh_cs = 7,
+                              const int32_t* reuse_counts = nullptr);
 
 // ---- the packed-int routed experts (2026-09-12, docs/glm53_plan.md D2) ----
 // The same contracts as the FP8 / NVFP4 launchers above over expert-view

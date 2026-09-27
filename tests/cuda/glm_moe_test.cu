@@ -2057,6 +2057,75 @@ DGPP_TEST(moe_nvfp4_gate_reuse_is_bitwise_and_graph_safe) {
   c.free_all();
 }
 
+DGPP_TEST(moe_nvfp4_down_reuse_is_bitwise_and_graph_safe) {
+  constexpr int E = 32, H = 2560, I = 640, K = 10, M = 24;
+  constexpr int in_stride = I + 8, out_stride = H + 8;
+  SmallCase c = make_small_case(E, H, I, K, M, 0xD04E05, true);
+  c.alloc();
+  int32_t *ids = nullptr, *order = nullptr, *counts = nullptr;
+  dgpp::MoeExpertView* views = nullptr;
+  uint16_t* act = nullptr;
+  float *ref = nullptr, *got = nullptr;
+  const size_t input_elems = static_cast<size_t>(M) * (K + 1) * in_stride;
+  const size_t output_elems = static_cast<size_t>(M) * (K + 1) * out_stride + 16;
+  DGPP_CUDA_OK(cudaMallocManaged(&ids, M * K * sizeof(int32_t)));
+  DGPP_CUDA_OK(cudaMallocManaged(&order, M * (K + 1) * sizeof(int32_t)));
+  DGPP_CUDA_OK(cudaMallocManaged(&counts, M * (K + 1) * sizeof(int32_t)));
+  DGPP_CUDA_OK(cudaMallocManaged(&views, E * 3 * sizeof(*views)));
+  DGPP_CUDA_OK(cudaMallocManaged(&act, input_elems * sizeof(uint16_t)));
+  DGPP_CUDA_OK(cudaMallocManaged(&ref, output_elems * sizeof(float)));
+  DGPP_CUDA_OK(cudaMallocManaged(&got, output_elems * sizeof(float)));
+  for (int i = 0; i < E * 3; ++i) views[i] = dgpp::MoeExpertView::of(c.expert_mats_fp4[i]);
+  // Independent activations for every token/expert slot, including the same
+  // expert in different rows. Reusing a token-only input must fail this test.
+  Rng rng(0xD04AC7);
+  std::vector<uint16_t> inputs(input_elems);
+  fill_act(rng, inputs);
+  std::memcpy(act, inputs.data(), input_elems * sizeof(uint16_t));
+  auto routes = [&](int rows, bool shared, unsigned seed) {
+    std::mt19937 gen(seed);
+    for (int t = 0; t < rows; ++t) {
+      std::vector<int> route;
+      for (int e = 0; e < E; ++e) route.push_back(e);
+      if (!shared) std::shuffle(route.begin(), route.end(), gen);
+      route.resize(K);
+      std::sort(route.begin(), route.end());
+      std::copy(route.begin(), route.end(), ids + t * K);
+    }
+  };
+  cudaStream_t stream;
+  DGPP_CUDA_OK(cudaStreamCreate(&stream));
+  for (const int rows : {3, 4, 8, 12, 24}) {
+    for (const int width : {H - 3, H}) {
+      DGPP_CUDA_OK(cudaMemset(ref, 0xA5, output_elems * sizeof(float)));
+      DGPP_CUDA_OK(cudaMemset(got, 0xA5, output_elems * sizeof(float)));
+      cudaGraph_t graph;
+      cudaGraphExec_t exec;
+      DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+      dgpp::launch_moe_slot_order(ids, order, rows * (K + 1), K, E, stream, counts);
+      for (const bool reuse : {false, true})
+        dgpp::launch_moe_slot_down_fp4(act, in_stride, ids, order, views, width, I,
+            0, 0, nullptr, nullptr, reuse ? got : ref, out_stride,
+            rows * (K + 1), K, stream, -1, 16, 7, 7, reuse ? counts : nullptr);
+      DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+      DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+      for (int repeat = 0; repeat < 2; ++repeat) {
+        routes(rows, repeat == 0, 42 + repeat);
+        DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+        DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        require(std::memcmp(ref, got, output_elems * sizeof(float)) == 0,
+                "NVFP4 down reuse changed an FP32 result, padding or inactive slot");
+      }
+      DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
+      DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    }
+  }
+  DGPP_CUDA_OK(cudaStreamDestroy(stream));
+  cudaFree(ids); cudaFree(order); cudaFree(counts); cudaFree(views);
+  cudaFree(act); cudaFree(ref); cudaFree(got);
+  c.free_all();
+}
+
 DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path_nvfp4) {
   struct Case {
     int E, H, I, K, M;

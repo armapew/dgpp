@@ -1928,6 +1928,66 @@ __global__ void moe_slot_down_fp4_kernel(
   }
 }
 
+// The gate/up planner's groups also share the down matrix. Each activation
+// belongs to a logical token/expert slot; unlike gate/up, it is not token-only.
+template <int K, int Rows>
+__device__ __forceinline__ void fp4_down_reuse_rows(
+    const uint16_t* act, size_t act_stride, const int32_t* ids, const int32_t* order,
+    const MoeExpertView* views, uint16_t* sx, float* out, int out_stride,
+    int top_k, int n) {
+  using G = fp4_gemv::Geom<K>;
+  const int n0 = blockIdx.x * G::rows_per_block;
+  int slots[Rows];
+#pragma unroll
+  for (int r = 0; r < Rows; ++r) slots[r] = order[blockIdx.y + r];
+  const int slot = slots[0], token = slot / (top_k + 1), route = slot % (top_k + 1);
+  const MoeExpertView v = views[ids[token * top_k + route] * 3 + 2];
+  fp4_gemv::PassLoads<G::pass_chunks(0)> L0;
+  fp4_gemv::issue_pass<K, 0, G::pass_chunks(0), 16, kFp4SlotStreaming>(
+      v.payload, v.fp4_scales, n0, n, L0);
+  if ((reinterpret_cast<uintptr_t>(act) & 15u) == 0 && act_stride % 8 == 0) {
+    for (int i = threadIdx.x; i < Rows * (K / 8); i += blockDim.x) {
+      const int r = i / (K / 8), c = i % (K / 8);
+      reinterpret_cast<uint4*>(sx + r * K)[c] =
+          reinterpret_cast<const uint4*>(act + static_cast<size_t>(slots[r]) * act_stride)[c];
+    }
+  } else {
+    for (int i = threadIdx.x; i < Rows * K; i += blockDim.x)
+      sx[i] = act[static_cast<size_t>(slots[i / K]) * act_stride + i % K];
+  }
+  __syncthreads();
+  float acc[fp4_gemv::kSteps][Rows];
+  fp4_gemv::warp_row_dots_issued<K, Rows, 16, kFp4SlotStreaming>(
+      L0, v.payload, v.fp4_scales, sx, n0, n, acc);
+  const float g = *v.fp4_global;
+#pragma unroll
+  for (int st = 0; st < fp4_gemv::kSteps; ++st) {
+    bool mine = false;
+    const int row = fp4_gemv::owned_row<K>(n0, st, mine);
+    if (!mine || row >= n) continue;
+#pragma unroll
+    for (int r = 0; r < Rows; ++r)
+      fp4_gemv::store_dot(out + static_cast<size_t>(slots[r]) * out_stride + row,
+                         __fdiv_rn(acc[st][r], g));
+  }
+}
+
+template <int K>
+__global__ void moe_slot_down_fp4_reuse_kernel(
+    const uint16_t* act, size_t act_stride, const int32_t* ids, const int32_t* order,
+    const int32_t* reuse_counts, const MoeExpertView* views, float* out,
+    int out_stride, int top_k, int n) {
+  const int count = reuse_counts[blockIdx.y];
+  if (count == 0) return;
+  extern __shared__ __align__(16) uint16_t sx[];
+  switch (count) {
+    case 1: fp4_down_reuse_rows<K, 1>(act, act_stride, ids, order, views, sx, out, out_stride, top_k, n); break;
+    case 2: fp4_down_reuse_rows<K, 2>(act, act_stride, ids, order, views, sx, out, out_stride, top_k, n); break;
+    case 3: fp4_down_reuse_rows<K, 3>(act, act_stride, ids, order, views, sx, out, out_stride, top_k, n); break;
+    case 4: fp4_down_reuse_rows<K, 4>(act, act_stride, ids, order, views, sx, out, out_stride, top_k, n); break;
+  }
+}
+
 // The host path's grouped kernel over NVFP4 segments: rows staged four at a
 // time (the multi-group loop), every weight row through the fp4 core. Every
 // thread reaches every barrier: the core has no warp-uniform early return.
@@ -4240,7 +4300,7 @@ void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
                               const uint8_t* sh_payload, const float* sh_scales,
                               float* out, int out_stride, int slots, int top_k,
                               cudaStream_t stream, int shared_view_base, int fp4_group,
-                              int sh_rs, int sh_cs) {
+                              int sh_rs, int sh_cs, const int32_t* reuse_counts) {
   if (slots <= 0) return;
   check_fp4_slot_args(act, ids, views, out, n_routed, k_routed, n_shared, k_shared,
                       shared_view_base, "moe_slot_down_fp4", fp4_group);
@@ -4250,6 +4310,22 @@ void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
         "moe_slot_down_fp4: shared payload must be 16B-aligned with k % 16 == 0");
   if (out_stride < n_routed || out_stride < n_shared)
     throw std::invalid_argument("moe_slot_down_fp4: out_stride below n");
+  if (reuse_counts) {
+    if (!order || n_shared != 0 || shared_fp4 || fp4_group != 16 ||
+        (k_routed != 64 && k_routed != 640) || top_k <= 0 || slots % (top_k + 1) != 0)
+      throw std::invalid_argument("moe_slot_down_fp4: reuse requires Qwen routed NVFP4 geometry and sorted slots");
+    const auto launch = [&](auto kc) {
+      constexpr int K = decltype(kc)::value;
+      const dim3 grid((n_routed + fp4_gemv::Geom<K>::rows_per_block - 1) /
+                         fp4_gemv::Geom<K>::rows_per_block, slots);
+      moe_slot_down_fp4_reuse_kernel<K><<<grid, fp8_gemv::kThreads, 4 * K * 2, stream>>>(
+          act, act_stride, ids, order, reuse_counts, views, out, out_stride, top_k, n_routed);
+    };
+    if (k_routed == 640) launch(std::integral_constant<int, 640>{});
+    else launch(std::integral_constant<int, 64>{});
+    DGPP_CUDA_OK(cudaGetLastError());
+    return;
+  }
   const int max_n = n_routed > n_shared ? n_routed : n_shared;
   const int max_k = k_routed > k_shared ? k_routed : k_shared;
   const auto go = [&](auto kc, auto gc) {
