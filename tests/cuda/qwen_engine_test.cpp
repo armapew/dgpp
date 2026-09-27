@@ -117,9 +117,8 @@ std::vector<std::unique_ptr<CollectiveBus>> start_world(int world, uint16_t port
 struct ConstructBarrier {
   std::mutex mu;
   std::condition_variable cv;
-  const int world;
   int left;
-  explicit ConstructBarrier(int count) : world(count), left(count) {}
+  explicit ConstructBarrier(int world) : left(world) {}
   void arrive_and_wait() {
     std::unique_lock<std::mutex> lock(mu);
     if (--left == 0) cv.notify_all();
@@ -283,24 +282,20 @@ void rank_work_mtp(int r, const QwenTextConfig& cfg, const std::string& dir, con
   };
   uint16_t* scratch = nullptr;
   try {
-    const int world = barrier->world;
     BusBoundaryReducer reducer(*bus, wait_timeout_ms());
-    auto* boundary = world > 1 ? &reducer : nullptr;
-    QwenModel eager(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, boundary, r, world, kSlots);
-    QwenModel mtp(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, boundary, r, world, kSlots,
-                  /*mtp=*/true, /*decode_rows=*/depth > 2 ? kSlots * (1 + depth) : 0, /*fp8_head_mma=*/false,
-                  /*serving_logits=*/true);
+    QwenModel eager(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, &reducer, r, kWorld, kSlots);
+    QwenModel mtp(cfg, dir, kMaxTokens, kCache, QwenResidency::Resident, &reducer, r, kWorld, kSlots, /*mtp=*/true);
     DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
-                               sizeof(uint16_t) * dgpp::kPickScratchElems(world), cudaHostAllocDefault));
+                               sizeof(uint16_t) * dgpp::kPickScratchElems(kWorld), cudaHostAllocDefault));
     arrive_once();
     EagerEngineAdapter<QwenModel> eager_engine(
-        &eager, kSlots, dgpp::make_fabric_pick(bus, r, world, scratch, cfg.vocab_size, wait_timeout_ms()));
+        &eager, kSlots, dgpp::make_fabric_pick(bus, r, kWorld, scratch, cfg.vocab_size, wait_timeout_ms()));
     out->ea = solo(eager_engine, 0, A, kSteps);
     out->eb = solo(eager_engine, 1, B, kSteps);
     out->ec = solo(eager_engine, 2, C, kSteps);
     {
       GraphEngineAdapter<QwenModel> mtp_engine(
-          &mtp, bus, r, world, scratch, cfg.vocab_size, wait_timeout_ms(),
+          &mtp, bus, r, kWorld, scratch, cfg.vocab_size, wait_timeout_ms(),
           /*batch_min_live=*/2, /*prefix_scratch=*/nullptr,
           /*gather_scratch=*/nullptr, /*candidates=*/0, /*grammar=*/nullptr,
           /*prefix_slots=*/0, /*mtp_depth=*/depth, test_compaction());
@@ -379,15 +374,7 @@ void rank_work_mtp(int r, const QwenTextConfig& cfg, const std::string& dir, con
 
 }  // namespace
 
-DGPP_TEST(qwen_engines_world_of_one_mtp_graph_matches_plain_decode) {
-  // Single-Spark serving has no RoCE lane. Exercise the production identity
-  // bus with both draft depths and table modes, without requiring a fabric.
-  const QwenTextConfig cfg = qwenfx::tiny_config();
-  const std::string dir = "qwen_engine_world1_fixture";
-  qwenfx::write_fixture(cfg, dir);
-  const auto A = smoke_tokens(cfg, 23, 0x9E3779B97F4A7C15ull);
-  const auto B = smoke_tokens(cfg, 17, 0xD1B54A32D192ED03ull);
-  const auto C = smoke_tokens(cfg, 11, 0x2545F4914F6CDD1Dull);
+DGPP_TEST(qwen_engines_world_of_one_request_bound_preserves_mtp_and_slot_reuse) {
   struct RestoreModes {
     bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();
     bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
@@ -396,180 +383,340 @@ DGPP_TEST(qwen_engines_world_of_one_mtp_graph_matches_plain_decode) {
       dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
     }
   } restore;
+  const auto original = qwenfx::tiny_config();
+  const std::string dir = "qwen_engine_request_bound_fixture";
+  qwenfx::write_fixture(original, dir);
+  const std::vector<int> lengths{161, 153, 149, 145};
+  const std::vector<int> limits{12, 36, 40, 44};
+  std::vector<std::vector<int64_t>> prompts;
+  for (int i = 0; i < 4; ++i) prompts.push_back(smoke_tokens(original, lengths[i], 0xAB00 + i));
+  dgpp::QwenLayerStream::set_ngram_table_mmap(true);
   for (bool fp8 : {false, true}) {
     dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
-    Ref reference;
-    bool first = true;
-    for (bool mapped : {false, true}) {
-      dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
-      for (int depth : {1, 2, 3}) {
-        auto buses = start_world(1, kPort + 20);
-        require(buses.size() == 1, "world-of-one bus failed to start");
-        ConstructBarrier barrier(1);
-        RankOutcome result;
-        rank_work_mtp(0, cfg, dir, A, B, C, buses[0].get(), &barrier, &result, depth);
-        require(result.error.empty(), result.error);
-        require(result.ma == result.ea && result.mb == result.eb && result.mc == result.ec,
-                "world-of-one scalar/batched MTP differs from plain eager decode");
-        if (first) {
-          reference = Ref{result.ea, result.eb, result.ec};
-          first = false;
+    const auto run = [&](int context) {
+      auto cfg = original;
+      cfg.max_position_embeddings = context;
+      auto buses = start_world(1, kPort + 20);
+      QwenModel model(cfg, dir, 128, 1024, QwenResidency::Resident, nullptr, 0, 1,
+                      4, true, 8, fp8);
+      uint16_t* scratch = nullptr;
+      DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
+                                 sizeof(uint16_t) * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
+      std::vector<std::vector<int32_t>> result(5);
+      {
+        GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
+            cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 0, nullptr, 0, 1,
+            test_compaction());
+        for (int i = 0; i < 4; ++i) {
+          result[i].push_back(graph.prefill(i, prompts[i]));
+          graph.reserve(i, 193);
         }
-        require(result.ma == reference.a && result.mb == reference.b && result.mc == reference.c,
-                "world-of-one mapped table or draft depth changes the transcript");
+        std::vector<int> active{0, 1, 2, 3};
+        std::vector<int> generation{0, 1, 2, 3};
+        bool reused = false;
+        while (!active.empty()) {
+          const auto tokens = graph.step_batch(active);
+          std::vector<int> remaining;
+          bool reopen = false;
+          for (size_t j = 0; j < active.size(); ++j) {
+            const int slot = active[j], id = generation[slot];
+            auto& transcript = result[id];
+            transcript.insert(transcript.end(), tokens[j].begin(), tokens[j].end());
+            const int limit = id == 4 ? 7 : limits[id];
+            if (transcript.size() >= static_cast<size_t>(limit)) {
+              transcript.resize(static_cast<size_t>(limit));
+              graph.close(slot);
+              if (slot == 0 && !reused) reopen = true;
+            } else {
+              remaining.push_back(slot);
+            }
+          }
+          if (reopen) {
+            require(!remaining.empty(), "slot reuse must overlap another active request");
+            generation[0] = 4;
+            result[4].push_back(graph.prefill(0, smoke_tokens(cfg, 13, 0xAC00)));
+            graph.reserve(0, 64);
+            remaining.push_back(0);
+            reused = true;
+          }
+          std::sort(remaining.begin(), remaining.end());
+          active = std::move(remaining);
+        }
+        require(reused, "the comparison must retire and reuse a slot while peers run");
+        graph.drain();
       }
-    }
+      DGPP_CUDA_OK(cudaFreeHost(scratch));
+      return result;
+    };
+    // Same weights and graph schedule. The first run keeps the old shared-
+    // pool stride; the second bounds it by an unaligned per-request ceiling.
+    require(run(1024) == run(193),
+            "bounding QSA workspace changes a four-slot MTP-1 transcript");
   }
 }
 
-DGPP_TEST(qwen_engines_world_of_one_four_slots_compact_fp8_head) {
+DGPP_TEST(qwen_compact_logits_preserve_cache_concurrency_and_mtp) {
   struct RestoreModes {
-    bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
     bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();
+    bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
     ~RestoreModes() {
-      dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
       dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
+      dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
     }
   } restore;
+  dgpp::QwenLayerStream::set_ngram_table_mmap(true);
   dgpp::QwenLayerStream::set_dense_weights_fp8(true);
-  dgpp::QwenLayerStream::set_ngram_table_mmap(true);
   const auto cfg = qwenfx::tiny_config();
-  const std::string dir = "qwen_engine_world1_four_fixture";
+  const std::string dir = "qwen_compact_logits_fixture";
   qwenfx::write_fixture(cfg, dir);
+  const std::vector<int> limits{12, 28, 36, 44};
   std::vector<std::vector<int64_t>> prompts;
-  for (int i = 0; i < 4; ++i) prompts.push_back(smoke_tokens(cfg, 17 + i * 4, 0xAB00 + i));
-  for (bool compact_batches : {false, true}) for (int depth : {1, 2, 3, 4, 5}) {
-    auto buses = start_world(1, kPort + 21);
-    require(buses.size() == 1, "world-of-one four-slot bus");
-    const int rows = 4 * (depth + 1);
-    QwenModel eager(cfg, dir, 128, 1024, QwenResidency::Resident, nullptr, 0, 1, 4,
-                    false, rows, true, false);
-    QwenModel model(cfg, dir, 128, 1024, QwenResidency::Resident, nullptr, 0, 1, 4,
-                    true, rows, true, true);
-    EagerEngineAdapter<QwenModel> plain(&eager, 4, dgpp::make_w1_pick(cfg.vocab_size));
-    std::vector<std::vector<int32_t>> expected;
-    for (int i = 0; i < 4; ++i) expected.push_back(solo(plain, i, prompts[i], 12 + i * 6));
-    uint16_t* scratch = nullptr;
-    DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
-                               sizeof(uint16_t) * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
-    {
-      GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
-          cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 0, nullptr, 0, depth, compact_batches);
-      std::vector<std::vector<int32_t>> actual(4);
-      for (int i = 0; i < 4; ++i) {
-        actual[i].push_back(graph.prefill(i, prompts[i]));
-        graph.reserve(i, prompts[i].size() + 48 + depth);
-      }
-      std::vector<int> active{0, 1, 2, 3};
-      while (!active.empty()) {
-        const auto tokens = graph.step_batch(active);
-        std::vector<int> remaining;
-        for (size_t j = 0; j < active.size(); ++j) {
-          const int i = active[j];
-          actual[i].insert(actual[i].end(), tokens[j].begin(), tokens[j].end());
-          if (actual[i].size() >= expected[i].size()) {
-            actual[i].resize(expected[i].size());
-            require(actual[i] == expected[i], "four-slot compact FP8/MMA head differs from eager, depth " + std::to_string(depth));
-            graph.close(i);
-          } else {
-            remaining.push_back(i);
-          }
+  for (int i = 0; i < 4; ++i) prompts.push_back(smoke_tokens(cfg, 17 + i * 8, 0xAB00 + i));
+  for (int depth : {1, 2, 3, 4, 5}) {
+    const auto run = [&](bool compact) {
+      auto buses = start_world(1, kPort + 22);
+      require(buses.size() == 1, "compact logits: world-of-one bus");
+      const int rows = 4 * (depth + 1);
+      QwenModel model(cfg, dir, 128, 2048, QwenResidency::Resident, nullptr, 0, 1,
+                      4, true, rows, true, compact);
+      require(model.logits_capacity_rows() == (compact ? rows : 128), "compact decode capacity");
+      uint16_t* scratch = nullptr;
+      DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
+                                 sizeof(uint16_t) * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
+      std::vector<std::vector<int32_t>> result(7);
+      {
+        GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
+            cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 0, nullptr, 1, depth, false);
+        std::vector<const std::vector<int64_t>*> inputs;
+        for (const auto& prompt : prompts) inputs.push_back(&prompt);
+        const auto first = graph.prefill_group({0, 1, 2, 3}, inputs);
+        require(first.size() == 4, "grouped prefill returned every slot");
+        for (int i = 0; i < 4; ++i) {
+          result[i].push_back(first[i]);
+          graph.reserve(i, 256);
         }
-        active = std::move(remaining);
+        std::vector<int> active{0, 1, 2, 3}, generation{0, 1, 2, 3};
+        bool reused = false;
+        while (!active.empty()) {
+          const auto tokens = graph.step_batch(active);
+          std::vector<int> remaining;
+          bool reopen = false;
+          for (size_t j = 0; j < active.size(); ++j) {
+            const int slot = active[j], id = generation[slot];
+            auto& transcript = result[id];
+            transcript.insert(transcript.end(), tokens[j].begin(), tokens[j].end());
+            const int limit = id == 4 ? 7 : limits[id];
+            if (transcript.size() >= static_cast<size_t>(limit)) {
+              transcript.resize(limit);
+              graph.close(slot);
+              if (slot == 0 && !reused) reopen = true;
+            } else {
+              remaining.push_back(slot);
+            }
+          }
+          if (reopen) {
+            require(!remaining.empty(), "slot reuse must overlap active peers");
+            generation[0] = 4;
+            result[4].push_back(graph.prefill(0, smoke_tokens(cfg, 13, 0xAC00)));
+            graph.reserve(0, 64);
+            remaining.push_back(0);
+            reused = true;
+          }
+          std::sort(remaining.begin(), remaining.end());
+          active = std::move(remaining);
+        }
+        require(reused, "slot was retired and reused");
+
+        // Keep two peers decoding while the middle slot fills, snapshots and
+        // then reuses the same prefix. Required cuts keep the row shapes fixed.
+        const auto long_prompt = smoke_tokens(cfg, 95, 0xCA00);
+        const std::vector<int64_t> cuts{32, 64};
+        for (const int slot : {0, 3}) {
+          (void)graph.prefill(slot, smoke_tokens(cfg, 11, 0xCB00 + slot));
+          graph.reserve(slot, 256);
+        }
+        for (int round = 0; round < 2; ++round) {
+          dgpp::sched::SchedulerEngine::PrefixPrefill plan;
+          plan.boundaries = &cuts;
+          if (round == 0) {
+            plan.snap_slot = 0;
+            plan.snap_position = 32;
+          } else {
+            plan.attach_slot = 0;
+            plan.attach_position = 32;
+          }
+          graph.begin_prefill(1, long_prompt, 128, 32, plan);
+          int64_t computed = 0;
+          auto& transcript = result[5 + round];
+          while (transcript.empty()) {
+            const auto progress = graph.advance_prefill(1);
+            computed += progress.computed_tokens;
+            if (progress.first_token >= 0) transcript.push_back(progress.first_token);
+            else (void)graph.step_batch({0, 3});
+          }
+          require(computed == (round == 0 ? 95 : 63), "prefix reuse skipped exactly 32 tokens");
+          graph.reserve(1, 128);
+          while (transcript.size() < 20) {
+            const auto tokens = graph.step_batch({0, 1, 3});
+            transcript.insert(transcript.end(), tokens[1].begin(), tokens[1].end());
+          }
+          transcript.resize(20);
+          graph.close(1);
+        }
+        require(result[5] == result[6], "cached and cold fixed-shape transcripts differ");
+        graph.close(0);
+        graph.close(3);
+        graph.prefix_release(0);
+        graph.drain();
       }
-      graph.drain();
-    }
-    cudaFreeHost(scratch);
+      DGPP_CUDA_OK(cudaFreeHost(scratch));
+      return result;
+    };
+    require(run(false) == run(true),
+            "compact logits changed graph/cache transcripts at MTP depth " + std::to_string(depth));
+    std::printf("[ .. ] compact/full logits: four slots, cache reuse, retirement and MTP depth %d exact\n", depth);
   }
 }
 
-DGPP_TEST(qwen_engines_world_of_one_scalar_crossover_retire_and_reuse) {
+static void check_fp4_reuse_lifecycle(const char* env_key) {
   struct RestoreModes {
-    bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
+    const char* key;
     bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();
+    bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
+    bool had_env;
+    std::string old_env;
+    explicit RestoreModes(const char* k)
+        : key(k), had_env(std::getenv(k) != nullptr), old_env(had_env ? std::getenv(k) : "") {}
     ~RestoreModes() {
-      dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
+      if (had_env) setenv(key, old_env.c_str(), 1);
+      else unsetenv(key);
       dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
+      dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
     }
-  } restore;
-  const auto cfg = qwenfx::tiny_config();
-  const std::string dir = "qwen_engine_scalar_crossover_fixture";
-  qwenfx::write_fixture(cfg, dir);
-  std::vector<std::vector<int64_t>> prompts;
-  for (int i = 0; i < 5; ++i)
-    prompts.push_back(smoke_tokens(cfg, 17 + i * 3, 0xCA00 + i));
+  } restore(env_key);
   dgpp::QwenLayerStream::set_ngram_table_mmap(true);
-  for (bool fp8 : {false, true}) for (bool mtp : {false, true}) {
-    dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
-    auto buses = start_world(1, kPort + 22);
-    require(buses.size() == 1, "scalar crossover world-of-one bus");
-    QwenModel model(cfg, dir, 128, 1024, QwenResidency::Resident, nullptr, 0, 1, 4,
-                    mtp, 8, false, true);
-    uint16_t* scratch = nullptr;
-    DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
-                               sizeof(uint16_t) * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
-    {
-      GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
-          cfg.vocab_size, wait_timeout_ms(), 5, nullptr, nullptr, 0, nullptr, 0, 1, false);
-      require(graph.batch_min_live() == 5, "explicit scalar crossover must not be clamped to slot count");
-      require(graph.prefill_group_span_limit() == 0, "scalar mode must not combine cold prompt forwards");
-      const std::array<size_t, 5> lengths{9, 33, 17, 25, 17};
-      std::vector<std::vector<int32_t>> expected(5), actual(5);
-      // Establish each transcript in isolation, using the same MTP setting.
-      for (int i = 0; i < 5; ++i) {
-        expected[i].push_back(graph.prefill(0, prompts[i]));
-        graph.reserve(0, prompts[i].size() + 48);
-        while (expected[i].size() < lengths[i]) {
-          auto t = graph.step(0);
-          expected[i].insert(expected[i].end(), t.begin(), t.end());
+  dgpp::QwenLayerStream::set_dense_weights_fp8(true);
+  const auto cfg = qwenfx::tiny_nvfp4_config();
+  const std::string dir = std::string("qwen_fp4_reuse_fixture_") + env_key;
+  qwenfx::write_fixture(cfg, dir, qwenfx::tiny_text_json(), qwenfx::tiny_nvfp4_quant_json());
+  const std::vector<int> limits{12, 28, 36, 44};
+  std::vector<std::vector<int64_t>> prompts;
+  for (int i = 0; i < 4; ++i) prompts.push_back(smoke_tokens(cfg, 17 + i * 8, 0xAB00 + i));
+  for (int depth : {1, 2, 3, 4, 5}) {
+    const auto run = [&](bool reuse) {
+      setenv(env_key, reuse ? "1" : "0", 1);
+      auto buses = start_world(1, kPort + 24);
+      require(buses.size() == 1, "expert reuse: world-of-one bus");
+      const int rows = 4 * (depth + 1);
+      QwenModel model(cfg, dir, 128, 2048, QwenResidency::Resident, nullptr, 0, 1,
+                      4, true, rows, true, true);
+      require(cfg.experts_nvfp4 && cfg.hidden_size == 256, "fixture must exercise NVFP4 reuse");
+      uint16_t* scratch = nullptr;
+      DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
+                                 sizeof(uint16_t) * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
+      std::vector<std::vector<int32_t>> result(7);
+      {
+        GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
+            cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 0, nullptr, 1, depth, false);
+        std::vector<const std::vector<int64_t>*> inputs;
+        for (const auto& prompt : prompts) inputs.push_back(&prompt);
+        const auto first = graph.prefill_group({0, 1, 2, 3}, inputs);
+        require(first.size() == 4, "grouped prefill returned every slot");
+        for (int i = 0; i < 4; ++i) {
+          result[i].push_back(first[i]);
+          graph.reserve(i, 256);
         }
-        expected[i].resize(lengths[i]);
-        graph.close(0);
-      }
-      std::array<int, 4> jobs{0, 1, 2, 3};
-      const auto firsts = graph.prefill_group({0, 1, 2, 3},
-          {&prompts[0], &prompts[1], &prompts[2], &prompts[3]});
-      for (int slot = 0; slot < 4; ++slot) {
-        actual[slot].push_back(firsts[slot]);
-        graph.reserve(slot, prompts[slot].size() + 48);
-      }
-      std::vector<int> active{0, 1, 2, 3};
-      while (!active.empty()) {
-        const auto before = graph.decode_batch_stats();
-        const auto tokens = graph.step_batch(active);
-        const auto after = graph.decode_batch_stats();
-        require(after.replays_by_slots[1] - before.replays_by_slots[1] == active.size(),
-                "every active request must replay its own scalar graph");
-        require(after.padded_rows == before.padded_rows, "scalar requests must have no padded batch rows");
-        std::vector<int> remaining;
-        bool refill = false;
-        for (size_t j = 0; j < active.size(); ++j) {
-          const int slot = active[j], job = jobs[slot];
-          actual[job].insert(actual[job].end(), tokens[j].begin(), tokens[j].end());
-          if (actual[job].size() >= lengths[job]) {
-            actual[job].resize(lengths[job]);
-            require(actual[job] == expected[job], "scalar transcript changes with occupancy/slot reuse");
-            graph.close(slot);
-            if (job == 0) refill = true;
-          } else {
-            remaining.push_back(slot);
+        std::vector<int> active{0, 1, 2, 3}, generation{0, 1, 2, 3};
+        bool reused = false;
+        while (!active.empty()) {
+          const auto tokens = graph.step_batch(active);
+          std::vector<int> remaining;
+          bool reopen = false;
+          for (size_t j = 0; j < active.size(); ++j) {
+            const int slot = active[j], id = generation[slot];
+            auto& transcript = result[id];
+            transcript.insert(transcript.end(), tokens[j].begin(), tokens[j].end());
+            const int limit = id == 4 ? 7 : limits[id];
+            if (transcript.size() >= static_cast<size_t>(limit)) {
+              transcript.resize(limit);
+              graph.close(slot);
+              if (slot == 0 && !reused) reopen = true;
+            } else {
+              remaining.push_back(slot);
+            }
           }
+          if (reopen) {
+            require(!remaining.empty(), "slot reuse must overlap active peers");
+            generation[0] = 4;
+            result[4].push_back(graph.prefill(0, smoke_tokens(cfg, 13, 0xAC00)));
+            graph.reserve(0, 64);
+            remaining.push_back(0);
+            reused = true;
+          }
+          std::sort(remaining.begin(), remaining.end());
+          active = std::move(remaining);
         }
-        // Reuse slot zero while slot one and the other survivors still decode.
-        if (refill) {
-          jobs[0] = 4;
-          actual[4].push_back(graph.prefill(0, prompts[4]));
-          graph.reserve(0, prompts[4].size() + 48);
-          remaining.push_back(0);
+        require(reused, "slot was retired and reused");
+
+        // Keep two peers decoding while the middle slot fills, snapshots and
+        // then reuses the same prefix. Required cuts keep the row shapes fixed.
+        const auto long_prompt = smoke_tokens(cfg, 95, 0xCA00);
+        const std::vector<int64_t> cuts{32, 64};
+        for (const int slot : {0, 3}) {
+          (void)graph.prefill(slot, smoke_tokens(cfg, 11, 0xCB00 + slot));
+          graph.reserve(slot, 256);
         }
-        active = std::move(remaining);
+        for (int round = 0; round < 2; ++round) {
+          dgpp::sched::SchedulerEngine::PrefixPrefill plan;
+          plan.boundaries = &cuts;
+          if (round == 0) {
+            plan.snap_slot = 0;
+            plan.snap_position = 32;
+          } else {
+            plan.attach_slot = 0;
+            plan.attach_position = 32;
+          }
+          graph.begin_prefill(1, long_prompt, 128, 32, plan);
+          int64_t computed = 0;
+          auto& transcript = result[5 + round];
+          while (transcript.empty()) {
+            const auto progress = graph.advance_prefill(1);
+            computed += progress.computed_tokens;
+            if (progress.first_token >= 0) transcript.push_back(progress.first_token);
+            else (void)graph.step_batch({0, 3});
+          }
+          require(computed == (round == 0 ? 95 : 63), "prefix reuse skipped exactly 32 tokens");
+          graph.reserve(1, 128);
+          while (transcript.size() < 20) {
+            const auto tokens = graph.step_batch({0, 1, 3});
+            transcript.insert(transcript.end(), tokens[1].begin(), tokens[1].end());
+          }
+          transcript.resize(20);
+          graph.close(1);
+        }
+        require(result[5] == result[6], "cached and cold fixed-shape transcripts differ");
+        graph.close(0);
+        graph.close(3);
+        graph.prefix_release(0);
+        graph.drain();
       }
-      graph.drain();
-      for (size_t f = 0; f < graph.batch_families().size(); ++f)
-        require(graph.batch_family_steps(static_cast<int>(f)) == 0, "row batch must never replay");
-    }
-    cudaFreeHost(scratch);
+      DGPP_CUDA_OK(cudaFreeHost(scratch));
+      return result;
+    };
+    require(run(false) == run(true),
+            "expert reuse changed graph/cache transcripts at MTP depth " + std::to_string(depth));
+    std::printf("[ .. ] %s off/on: four slots, cache reuse, retirement and MTP depth %d exact\n", env_key, depth);
   }
+}
+
+DGPP_TEST(qwen_fp4_gate_reuse_preserves_cache_concurrency_and_mtp) {
+  check_fp4_reuse_lifecycle("DGPP_FP4_GATE_REUSE");
+}
+
+DGPP_TEST(qwen_fp4_down_reuse_preserves_cache_concurrency_and_mtp) {
+  const char* gate = std::getenv("DGPP_FP4_GATE_REUSE");
+  require(!gate || gate[0] != '0', "down reuse check requires the existing gate grouping");
+  check_fp4_reuse_lifecycle("DGPP_FP4_DOWN_REUSE");
 }
 
 DGPP_TEST(qwen_engines_loopback_world_2_mtp_graph_matches_plain_decode) {
@@ -955,6 +1102,50 @@ DGPP_TEST(qwen_engines_loopback_world_2_wide_mtp_slot_reuse_and_continuation) {
         graph.close(0);
         graph.close(slots - 1);
         graph.prefix_release(0);
+      }
+      {
+        // Exercise the scheduler over real per-slot cursors and MTP graphs:
+        // idle admission opens four prefills, then the first completion
+        // reduces the tick budget below the remaining prefill count.
+        const int64_t align = graph.prefill_chunk_alignment();
+        dgpp::sched::AdmissionPolicy policy;
+        policy.prefill_budget_tokens = static_cast<int>(align);
+        policy.prefill_idle_budget_tokens = static_cast<int>(4 * align);
+        std::vector<dgpp::sched::SchedulerRequest> requests;
+        std::vector<std::vector<int64_t>> expected;
+        for (int i = 0; i < 4; ++i) {
+          dgpp::sched::SchedulerRequest request;
+          request.id = "fair-" + std::to_string(i);
+          request.prompt = smoke_tokens(cfg, i == 0 ? 9 * align : 15 * align + 1, 6400 + i);
+          request.max_steps = 12;
+          requests.push_back(request);
+          dgpp::sched::Scheduler solo_sched(&graph, {}, 0, policy, /*prefix_slots=*/0);
+          solo_sched.submit(request);
+          solo_sched.run_to_completion();
+          expected.push_back(solo_sched.find(request.id)->generated);
+        }
+        dgpp::sched::Scheduler concurrent(&graph, {}, 0, policy, /*prefix_slots=*/0);
+        for (const auto& request : requests) concurrent.submit(request);
+        bool saw_busy_rotation = false;
+        int ticks = 0;
+        while (concurrent.has_pending() && ++ticks < 256) {
+          const auto before = concurrent.meters();
+          const bool busy = before.active > before.prefilling;
+          saw_busy_rotation |= busy && before.prefilling > 1;
+          concurrent.tick();
+          require(concurrent.meters().prompt_tokens_computed - before.prompt_tokens_computed <=
+                      (busy ? policy.prefill_budget_tokens : policy.prefill_idle_budget_tokens),
+                  "real graph prefills exceed the current scheduler budget");
+        }
+        require(!concurrent.has_pending() && saw_busy_rotation,
+                "four graph prefills complete across a busy-budget rotation");
+        for (size_t i = 0; i < requests.size(); ++i) {
+          const auto* result = concurrent.find(requests[i].id);
+          require(result->steps_done == 12, "concurrent graph transcript is complete");
+          if (row_independent)
+            require(result->generated == expected[i], "fair-share graph prefill changes the solo transcript");
+        }
+        require(graph.pool_blocks_in_use() == 0, "concurrent graph prefill leaks KV reservations");
       }
       if (sample_cap) {
         std::vector<std::vector<int32_t>> reference;

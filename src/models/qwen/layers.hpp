@@ -220,7 +220,7 @@ class QwenQsaLayer {
   QwenQsaResident w_;
   QwenGemmWorkspace g_;
   int hidden_, lh_, lkv_, dim_, rotary_, idx_heads_, idx_dim_, kpool_, select_k_, max_selected_;
-  int max_tokens_, work_rows_;
+  int max_tokens_;
   int64_t max_pools_;
   float eps_, scale_;
   // The YaRN attention factor the cos/sin are built with (1.0f off the
@@ -235,12 +235,12 @@ class QwenQsaLayer {
   uint16_t* kn_ = nullptr;         // [M, lkv * D]
   uint16_t* idx_ = nullptr;        // [M, (nH + 1) * Di]
   uint16_t* qi_ = nullptr;         // [M, nH * Di]
-  uint64_t* keys_ws_ = nullptr;    // [work_rows, max_pools]
+  uint64_t* keys_ws_ = nullptr;    // [M, max_pools]
   int32_t* topk_ = nullptr;        // [M, max_selected]
   int32_t* counts_ = nullptr;      // [M]
-  float* m_ws_ = nullptr;          // [work_rows, n_split, lh]
+  float* m_ws_ = nullptr;          // [M, n_split, lh]
   float* l_ws_ = nullptr;
-  float* c_ws_ = nullptr;          // [work_rows, n_split, lh, D]
+  float* c_ws_ = nullptr;          // [M, n_split, lh, D]
   float* c_out_ = nullptr;         // [M, lh * D]
   uint16_t* o_ = nullptr;          // [M, lh * D]
   int n_split_ = 1;

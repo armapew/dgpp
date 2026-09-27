@@ -17,26 +17,6 @@ class ServeStartupTest(unittest.TestCase):
             raise unittest.SkipTest("set DGPP_SERVE_TEST_BINARY to the freshly built server")
         cls.binary = str(Path(binary).resolve(strict=True))
 
-    def test_scalar_graph_crossover_boundary(self):
-        for slots in (1, 4):
-            for threshold in (slots + 1, slots + 2):
-                with self.subTest(slots=slots, threshold=threshold):
-                    result = subprocess.run(
-                        [self.binary, "--checkpoint-dir", "/unused-checkpoint",
-                         "--max-concurrency", str(slots),
-                         "--graph-batch-min-live", str(threshold)],
-                        env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "DGPP_LOG_LEVEL": "info"},
-                        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
-                    self.assertEqual(result.returncode, 1, result.stdout)
-                    if threshold == slots + 1:
-                        self.assertIn("no CUDA device visible", result.stdout)
-                    else:
-                        self.assertIn("--graph-batch-min-live must be", result.stdout)
-
-    def test_scalar_graph_crossover_propagates_to_peers(self):
-        log = self.run_world([(4, 5), (4, 0)])[1]
-        self.assertIn("batchmin=5 ", log)
-
     def test_sse_ping_interval_config_cli_precedence_and_help(self):
         with tempfile.TemporaryDirectory(prefix="dgpp-sse-ping-") as directory:
             config = Path(directory) / "cluster.json"

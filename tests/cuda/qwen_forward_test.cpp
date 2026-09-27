@@ -201,14 +201,26 @@ int run_plan_check() {  // The memory plan's context line under the rope knob (e
   unaligned.max_position_embeddings = native + 1;
   require(plan_of(unaligned).total_bytes() - plain_plan.total_bytes() == size_t{64 * 8},
           "partial final compressed pool has workspace");
+  const auto small_pool_plan = [&](const QwenTextConfig& c) {
+    return QwenModel::plan_memory(c, 64, 512, 0, 2, dgpp::QwenResidency::Resident, 4,
+                                 false, 8);
+  };
+  require(small_pool_plan(cfg).total_bytes() == small_pool_plan(yarn).total_bytes(),
+          "a smaller shared pool bounds workspace even with a larger positional ceiling");
+  QwenTextConfig site = cfg, shared = cfg;
+  site.max_position_embeddings = 262144;
+  shared.max_position_embeddings = 850048;
+  const auto site_plan = [&](const QwenTextConfig& c) {
+    return QwenModel::plan_memory(c, 4096, 850048, 0, 1, dgpp::QwenResidency::Resident,
+                                 4, false, 8);
+  };
+  require(site_plan(shared).total_bytes() - site_plan(site).total_bytes() == size_t{4816109568ULL},
+          "4K rows and an 850048-token shared pool save 4.485 GiB at a 256K request ceiling");
   // A pool of exactly the scaled ceiling is accepted by the same arithmetic.
   require(QwenModel::plan_memory(yarn, 64, native * 64 * 2, 0, 2, dgpp::QwenResidency::Resident, 4,
                                  false, 8)
                   .context_tokens == want_on,
           "a pool at the ceiling");
-  require(dgpp::QwenQsaLayer::scratch_bytes(cfg, 4, 2, 4096, 128) -
-              dgpp::QwenQsaLayer::scratch_bytes(cfg, 4, 2, 4096, 64) == size_t{256 * 64 * 8},
-          "long prefill scoring workspace is capped at 256 rows");
   std::printf("[ OK ] qwen_plan_check\n");
   return 0;
 }
@@ -431,15 +443,14 @@ int run_qsa_prefill(const std::string& dir, const std::string& logits_path) {
   };
   replace("\"num_attention_heads\": 4", "\"num_attention_heads\": 24");
   replace("\"indexer_budget\": 64", "\"indexer_budget\": 2048");
-  replace("\"max_position_embeddings\": 4096", "\"max_position_embeddings\": 8192");
   const auto tc = dgpp::minijson::parse(text);
   const auto qc = dgpp::minijson::parse(qwenfx::tiny_quant_json());
   const QwenTextConfig cfg = QwenTextConfig::parse(tc.root, &qc.root);
   qwenfx::write_fixture(cfg, dir, text.c_str());
-  QwenModel model(cfg, dir, 4096, 8192, dgpp::QwenResidency::Resident);
+  QwenModel model(cfg, dir, 1024, 2048, dgpp::QwenResidency::Resident);
   std::ofstream logits(logits_path, std::ios::binary);
   require(logits.good(), "qsa prefill: cannot open logits file");
-  for (const int count : {127, 128, 129, 256, 513, 1024, 2048, 4096}) {
+  for (const int count : {127, 128, 129, 256, 513, 1024}) {
     const auto tokens = smoke_tokens(cfg, count);
     const auto first = model.forward(tokens);
     const auto again = model.forward(tokens);

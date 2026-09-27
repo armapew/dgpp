@@ -49,7 +49,7 @@ size_t GlmMoeLayer::scratch_bytes(const GlmMoeConfig& cfg, int max_tokens,
   dev += M * H * 4;                  // d_acc_
   if (decode_slots > 0) {
     const size_t rows = static_cast<size_t>(decode_slots) * (K + 1);
-    dev += rows * I * 2 + rows * H * 4 + rows * 4;
+    dev += rows * I * 2 + rows * H * 4 + rows * 8;
     dev += static_cast<size_t>(decode_slots) * sizeof(int);
     dev += sizeof(MoeExpertView) * (E + 1) * 3;
     if (graph_table_slots > 0) {
@@ -156,7 +156,7 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
         static_cast<size_t>(decode_slots_) * (cfg_.top_k + 1);
     DGPP_CUDA_OK(cudaMalloc(&d_slot_act_, rows * I * 2));
     DGPP_CUDA_OK(cudaMalloc(&d_slot_down_, rows * H * sizeof(float)));
-    DGPP_CUDA_OK(cudaMalloc(&d_slot_order_, rows * sizeof(int32_t)));
+    DGPP_CUDA_OK(cudaMalloc(&d_slot_order_, rows * 2 * sizeof(int32_t)));
     // The fused router selection's tickets: one per decode row, zero at
     // rest (the last block of each launch resets its own).
     DGPP_CUDA_OK(cudaMalloc(&d_router_counters_,
@@ -508,6 +508,24 @@ void GlmMoeLayer::upload_expert_views(MoeExpertView* d_dst, bool with_shared,
   view_ring_armed_[slot] = true;
 }
 
+int GlmMoeLayer::routed_seg_max_rows(const MoeSegment* d_segs, int n_segs,
+                                     int fallback, cudaStream_t stream) {
+  static const bool enabled = [] {
+    const char* e = std::getenv("DGPP_MOE_SEG_MAX");
+    return e == nullptr || e[0] != '0';  // default on; =0 keeps tokens-wide
+  }();
+  if (!enabled || d_segs == nullptr || n_segs <= 0) return fallback;
+  // h_segs_ is pinned staging sized to n_experts + 1 (the host path uploads
+  // from it; here it is download scratch — the uses never interleave).
+  DGPP_CUDA_OK(cudaMemcpyAsync(h_segs_, d_segs,
+                               static_cast<size_t>(n_segs) * sizeof(MoeSegment),
+                               cudaMemcpyDeviceToHost, stream));
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  int longest = 1;
+  for (int e = 0; e < n_segs; ++e) longest = std::max(longest, h_segs_[e].rows);
+  return longest;
+}
+
 void GlmMoeLayer::enqueue_prefill(const uint16_t* hidden, uint16_t* out,
                                   int tokens, MoeTraceStaging* trace,
                                   cudaStream_t stream) {
@@ -561,7 +579,8 @@ void GlmMoeLayer::enqueue_prefill(const uint16_t* hidden, uint16_t* out,
   // the weights; the smallest batches retain the GEMV launchers.
   const bool mma = mma_takes_grid() && (!w_.packq() || tokens >= kPackqMmaFromRows);
   grouped_expert_chain(mma ? MoeExpertKernel::kMma : MoeExpertKernel::kGemv, hidden, d_segs_, E,
-                       /*max_rows=*/std::max(tokens, 1), d_segs_ + E, tokens, rows_total, stream);
+                       routed_seg_max_rows(d_segs_, E, std::max(tokens, 1), stream),
+                       d_segs_ + E, tokens, rows_total, stream);
   accumulate_grouped(out, nullptr, shared_row0, tokens, stream);
 }
 
@@ -611,8 +630,8 @@ void GlmMoeLayer::enqueue_prefill_f32(const uint16_t* hidden, float* out, int to
   // The routed chain alone (no shared segment) on the tensor-core kernel,
   // the fp32 chain handed back unrounded (shared_row0 < 0).
   grouped_expert_chain(kernel, hidden, d_segs_, E,
-                       /*max_rows=*/std::max(tokens, 1), /*shared_seg=*/nullptr,
-                       tokens, tk, stream);
+                       routed_seg_max_rows(d_segs_, E, std::max(tokens, 1), stream),
+                       /*shared_seg=*/nullptr, tokens, tk, stream);
   accumulate_grouped(nullptr, out, /*shared_row0=*/-1, tokens, stream);
 }
 
@@ -997,8 +1016,14 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   // expert order so an expert two rows share is read from DRAM once (see
   // launch_moe_slot_order); one token has nothing to share.
   const int32_t* order = nullptr;
+  int32_t* reuse_counts = nullptr;
+  const char* reuse_mode = std::getenv("DGPP_FP4_GATE_REUSE");
+  // Two-row verification regressed in the paired kernel screen; preserve C1 MTP-1.
+  const bool reuse = tokens > 2 && fp4 && !with_shared && w_.experts_fp4[0].scale_group == 16 &&
+                     (H == 2560 || H == 256) && (!reuse_mode || reuse_mode[0] != '0');
   if (tokens > 1) {
-    launch_moe_slot_order(d_ids_, d_slot_order_, slots, K, E, stream);
+    if (reuse) reuse_counts = d_slot_order_ + static_cast<size_t>(decode_slots_) * (K + 1);
+    launch_moe_slot_order(d_ids_, d_slot_order_, slots, K, E, stream, reuse_counts);
     order = d_slot_order_;
   }
   // Gate + up + swiglu in one launch (bit-identical to the three-launch
@@ -1024,10 +1049,14 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
     launch_moe_slot_gate_up_swiglu_fp4(
         hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,
         sh_up_p, sh_up_s, d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream,
-        shared_view_base, fp4_group, sh_rs, sh_cs);
+        shared_view_base, fp4_group, sh_rs, sh_cs, reuse_counts);
+    const char* down_mode = std::getenv("DGPP_FP4_DOWN_REUSE");
+    const bool reuse_down = reuse_counts && (I_r == 640 || I_r == 64) &&
+                            (!down_mode || down_mode[0] != '0');
     launch_moe_slot_down_fp4(d_slot_act_, I_r, d_ids_, order, table, H, I_r, N_s,
                              I_s, sh_down_p, sh_down_s, d_slot_down_, H, slots, K,
-                             stream, shared_view_base, fp4_group, sh_rs, sh_cs);
+                             stream, shared_view_base, fp4_group, sh_rs, sh_cs,
+                             reuse_down ? reuse_counts : nullptr);
   } else {
     launch_moe_slot_gate_up_swiglu(
         hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,

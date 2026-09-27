@@ -473,39 +473,130 @@ DGPP_TEST(qsa_index_score_and_select_match_the_reference_bitwise) {
   std::printf(" tokens, keys and lists bitwise\n");
 }
 
-DGPP_TEST(qsa_index_score_bounded_grid_and_compact_stride_preserve_visible_keys) {
+DGPP_TEST(qsa_request_bounded_workspace_preserves_scores_selection_and_graphs) {
+  constexpr int heads = 4, dim = 128, ppb = 16, kpool = 4, select_k = 512;
+  constexpr int requests = 2, width = select_k * kpool + kpool - 1, guard = 16;
+  cudaStream_t stream = test_stream();
+  // Full prefill row capacity with short/tail positions, then the native
+  // 256K ceiling and an unaligned ceiling. Physical blocks span the shared
+  // pool, including addresses beyond the compact logical workspace stride.
+  for (int context : {201, 262144, 262145}) {
+    const int rows = context == 201 ? 4096 : 8;
+    const int wide = context == 201 ? 4096 : 212512;
+    const int compact = (context + kpool - 1) / kpool;
+    const int blocks = (compact + ppb - 1) / ppb;
+    std::vector<int32_t> physical(wide / ppb);
+    std::iota(physical.begin(), physical.end(), 0);
+    std::mt19937 rng(20260927);
+    std::shuffle(physical.begin(), physical.end(), rng);
+    std::vector<int32_t> table(physical.begin(), physical.begin() + requests * blocks);
+    const std::vector<int64_t> cases{-1, 0, 2, 3, context / 2, context - 3,
+                                     context - 2, context - 1};
+    std::vector<int64_t> pos(rows);
+    std::vector<int32_t> req(rows);
+    for (int r = 0; r < rows; ++r) {
+      pos[r] = cases[static_cast<size_t>(r) % cases.size()];
+      req[r] = pos[r] < 0 ? -1 : r % requests;
+    }
+    const auto cache = random_bf16_normal(202, int64_t(wide) * dim, 1.0f);
+    const auto q = random_bf16_normal(203, int64_t(rows) * heads * dim, 1.0f);
+    DevBuf dc = up(cache), dq = up(q), dt = up(table), dp = up(pos), dr = up(req);
+    struct Result {
+      std::vector<uint64_t> keys;
+      std::vector<int32_t> selected, counts;
+    };
+    const auto calculate = [&](int stride, bool replay_graph, int64_t visible_pool_bound = -1) {
+      const size_t nkeys = size_t(rows) * stride;
+      DevBuf keys((nkeys + 2 * guard) * sizeof(uint64_t));
+      DevBuf selected(size_t(rows) * width * sizeof(int32_t)), counts(rows * sizeof(int32_t));
+      DGPP_CUDA_OK(cudaMemsetAsync(keys.p, 0xff, keys.bytes, stream));
+      const auto launch = [&] {
+        dgpp::qsa_index_score(ptr<uint16_t>(dq), heads * dim, ptr<int32_t>(dr),
+                             ptr<int64_t>(dp), rows, ptr<int32_t>(dt), blocks,
+                             ptr<uint16_t>(dc), ppb, heads, dim, kpool,
+                             mptr<uint64_t>(keys) + guard, stride, stream, visible_pool_bound);
+        dgpp::qsa_select_from_keys(ptr<uint64_t>(keys) + guard, stride, ptr<int64_t>(dp),
+                                  rows, select_k, kpool, width, mptr<int32_t>(selected),
+                                  mptr<int32_t>(counts), stream);
+      };
+      launch();
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+      Result result{down<uint64_t>(keys, nkeys + 2 * guard),
+                    down<int32_t>(selected, size_t(rows) * width),
+                    down<int32_t>(counts, rows)};
+      for (int i = 0; i < guard; ++i)
+        require(result.keys[i] == UINT64_MAX && result.keys[guard + nkeys + i] == UINT64_MAX,
+                "scoring changed a workspace guard");
+      for (int r = 0; r < rows; ++r) {
+        const int visible = pos[r] < 0 ? 0 : int((pos[r] + 1) / kpool);
+        for (int p = visible; p < stride; ++p)
+          require(result.keys[guard + size_t(r) * stride + p] == UINT64_MAX,
+                  "scoring changed an invisible key or inactive row");
+      }
+      if (replay_graph) {
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        launch();
+        DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+        DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (int repeat = 0; repeat < 2; ++repeat) {
+          DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+          DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+          require(down<uint64_t>(keys, nkeys + 2 * guard) == result.keys,
+                  "compact graph changed scoring keys or guards");
+          require(down<int32_t>(selected, size_t(rows) * width) == result.selected &&
+                      down<int32_t>(counts, rows) == result.counts,
+                  "compact graph changed selected tokens");
+        }
+        DGPP_CUDA_OK(cudaGraphExecDestroy(exec));
+        DGPP_CUDA_OK(cudaGraphDestroy(graph));
+      }
+      return result;
+    };
+    const auto reference = calculate(wide, false);
+    const auto capped = calculate(wide, true, context / kpool);
+    require(reference.keys == capped.keys && reference.selected == capped.selected &&
+                reference.counts == capped.counts,
+            "visible-pool launch bound changed scores, selection or guards");
+    const auto bounded = calculate(compact, true);
+    require(reference.selected == bounded.selected && reference.counts == bounded.counts,
+            "request-bounded workspace changed selected tokens");
+    for (int r = 0; r < rows; ++r)
+      for (int p = 0; p < compact; ++p)
+        require(reference.keys[guard + size_t(r) * wide + p] ==
+                    bounded.keys[guard + size_t(r) * compact + p],
+                "request-bounded workspace changed scoring keys");
+    std::printf("[ .. ] %d rows, context %d, stride %d -> %d: keys, selection and graphs exact\n",
+                rows, context, wide, compact);
+  }
+}
+
+DGPP_TEST(qsa_visible_pool_bound_handles_empty_context_and_invalid_bounds) {
   SelectFixture sf(20260926);
   const Geo& g = sf.f.g;
-  cudaStream_t st = test_stream();
-  const int64_t compact = (*std::max_element(sf.pos.begin(), sf.pos.end()) + 1) / g.kpool;
-  const int64_t wide = 4096;  // Many empty stripes beyond this request's keys.
-  const auto score = [&](int64_t stride, int64_t bound) {
-    DevBuf keys(static_cast<size_t>(sf.rows()) * stride * 8);
-    DGPP_CUDA_OK(cudaMemsetAsync(keys.p, 0xff, static_cast<size_t>(sf.rows()) * stride * 8, st));
-    dgpp::qsa_index_score(ptr<uint16_t>(sf.dq), static_cast<int64_t>(g.idx_heads) * g.idx_dim,
-        ptr<int32_t>(sf.dreq), ptr<int64_t>(sf.dpos), sf.rows(), ptr<int32_t>(sf.f.dtable),
-        g.blocks_per_request, ptr<uint16_t>(sf.dcache), g.pools_per_block(), g.idx_heads,
-        g.idx_dim, g.kpool, mptr<uint64_t>(keys), stride, st, bound);
-    DGPP_CUDA_OK(cudaStreamSynchronize(st));
-    return down<uint64_t>(keys, static_cast<size_t>(sf.rows()) * stride);
+  cudaStream_t stream = test_stream();
+  constexpr int64_t stride = 4096;
+  const auto score = [&](int64_t bound) {
+    const size_t count = static_cast<size_t>(sf.rows()) * stride;
+    DevBuf keys(count * sizeof(uint64_t));
+    DGPP_CUDA_OK(cudaMemsetAsync(keys.p, 0xff, keys.bytes, stream));
+    dgpp::qsa_index_score(ptr<uint16_t>(sf.dq), int64_t(g.idx_heads) * g.idx_dim,
+                          ptr<int32_t>(sf.dreq), ptr<int64_t>(sf.dpos), sf.rows(),
+                          ptr<int32_t>(sf.f.dtable), g.blocks_per_request,
+                          ptr<uint16_t>(sf.dcache), g.pools_per_block(), g.idx_heads,
+                          g.idx_dim, g.kpool, mptr<uint64_t>(keys), stride, stream, bound);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    return down<uint64_t>(keys, count);
   };
-  const auto reference = score(wide, -1);
-  const auto bounded = score(wide, compact);
-  require(reference == bounded, "bounded launch changes scores or untouched padding");
-  const auto small = score(compact, compact);
-  for (int r = 0; r < sf.rows(); ++r)
-    for (int64_t p = 0; p < compact; ++p)
-      require(small[static_cast<size_t>(r) * compact + p] ==
-              reference[static_cast<size_t>(r) * wide + p], "compact row stride changes scores");
-  // Before the first complete compressed pool, scoring must launch no work;
-  // selection uses only the incomplete tail. Include inactive padding rows.
+  // No complete compressed key exists yet; selection uses the incomplete tail.
   sf.pos.assign(static_cast<size_t>(sf.rows()), g.kpool - 2);
   sf.pos.back() = -1;
   sf.dpos.upload(sf.pos.data(), sf.pos.size() * sizeof(int64_t));
-  require(score(wide, -1) == score(wide, 0), "zero-visible launch changes padding");
-  for (int64_t invalid : {int64_t{-2}, wide + 1}) {
+  require(score(-1) == score(0), "zero-visible launch changed untouched keys");
+  for (int64_t invalid : {int64_t{-2}, stride + 1}) {
     bool threw = false;
-    try { (void)score(wide, invalid); }
+    try { (void)score(invalid); }
     catch (const std::invalid_argument&) { threw = true; }
     require(threw, "invalid visible bound accepted");
   }

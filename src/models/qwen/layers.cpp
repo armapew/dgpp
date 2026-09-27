@@ -456,21 +456,6 @@ size_t QwenGdnLayer::scratch_bytes(const QwenTextConfig& cfg, int local_key_head
 
 // ---- QwenQsaLayer ----------------------------------------------------------------
 
-namespace {
-int qsa_work_rows(int max_tokens) {
-  // Scoring/selection is independent per query row. Retain only a bounded
-  // score-key tile, while the selected indices remain available for all T
-  // attention rows. The fallback attention's per-row reduction buffers use
-  // the same bound. The override is for wide-vs-tiled numerical A/Bs.
-  static const int cap = [] {
-    const char* e = std::getenv("DGPP_QSA_WORKSPACE_ROWS");
-    const int value = e != nullptr ? std::atoi(e) : 256;
-    return value > 0 ? value : 256;
-  }();
-  return std::min(std::max(max_tokens, 0), cap);
-}
-}  // namespace
-
 QwenQsaLayer::QwenQsaLayer(const QwenQsaResident& w, const QwenGemmWorkspace& gemm,
                            const QwenTextConfig& cfg, int max_tokens, int64_t max_pools)
     : w_(w), g_(gemm), hidden_(cfg.hidden_size), lh_(w.local_heads), lkv_(w.local_kv_heads),
@@ -478,7 +463,7 @@ QwenQsaLayer::QwenQsaLayer(const QwenQsaResident& w, const QwenGemmWorkspace& ge
       idx_dim_(cfg.indexer_head_dim), kpool_(cfg.indexer_compress_ratio),
       select_k_(cfg.indexer_block_topk()),
       max_selected_(cfg.indexer_budget + cfg.indexer_compress_ratio - 1), max_tokens_(max_tokens),
-      work_rows_(qsa_work_rows(max_tokens)), max_pools_(max_pools), eps_(cfg.rms_norm_eps) {
+      max_pools_(max_pools), eps_(cfg.rms_norm_eps) {
   if (!g_.gemm || !g_.ws) throw std::invalid_argument("QwenQsaLayer: GEMM workspace required");
   if (lh_ <= 0 || lkv_ <= 0 || lh_ % lkv_ != 0)
     throw std::invalid_argument("QwenQsaLayer: query heads must be a multiple of kv heads");
@@ -510,12 +495,12 @@ QwenQsaLayer::QwenQsaLayer(const QwenQsaResident& w, const QwenGemmWorkspace& ge
   kn_ = dev_alloc<uint16_t>(M * static_cast<size_t>(lkv_) * dim_);
   idx_ = dev_alloc<uint16_t>(M * static_cast<size_t>(idx_heads_ + 1) * idx_dim_);
   qi_ = dev_alloc<uint16_t>(M * static_cast<size_t>(idx_heads_) * idx_dim_);
-  keys_ws_ = dev_alloc<uint64_t>(static_cast<size_t>(work_rows_) * max_pools_);
+  keys_ws_ = dev_alloc<uint64_t>(M * static_cast<size_t>(max_pools_));
   topk_ = dev_alloc<int32_t>(M * static_cast<size_t>(max_selected_));
   counts_ = dev_alloc<int32_t>(M);
   // Splits over the list: 256 tokens each, at most 8.
   n_split_ = std::max(1, std::min(8, (max_selected_ + 255) / 256));
-  const size_t part = static_cast<size_t>(work_rows_) * n_split_ * lh_;
+  const size_t part = M * static_cast<size_t>(n_split_) * lh_;
   m_ws_ = dev_alloc<float>(part);
   l_ws_ = dev_alloc<float>(part);
   c_ws_ = dev_alloc<float>(part * dim_);
@@ -618,16 +603,13 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
     qsa_index_tail_seed(raw_k, IW, d_req, d_pos, T, cache.ring, kpool_, Di, stream);
   }
   // Score every row's visible pools, select, attend.
-  for (int first = 0; first < T; first += work_rows_) {
-    const int count = std::min(work_rows_, T - first);
-    qsa_index_score(qi_ + static_cast<int64_t>(first) * idx_heads_ * Di,
-                    static_cast<int64_t>(idx_heads_) * Di, d_req + first, d_pos + first, count,
-                    cache.block_tables, cache.blocks_per_request, cache.index_cache, pools_per_block,
-                    idx_heads_, Di, kpool_, keys_ws_, max_pools_, stream,
-                    rows.decode ? -1 : (rows.pos0 + first + count) / kpool_);
-    qsa_select_from_keys(keys_ws_, max_pools_, d_pos + first, count, select_k_, kpool_, max_selected_,
-                         topk_ + static_cast<int64_t>(first) * max_selected_, counts_ + first, stream);
-  }
+  // Prefill positions are fixed here; decode graph positions can grow on replay.
+  qsa_index_score(qi_, static_cast<int64_t>(idx_heads_) * Di, d_req, d_pos, T, cache.block_tables,
+                  cache.blocks_per_request, cache.index_cache, pools_per_block, idx_heads_, Di, kpool_,
+                  keys_ws_, max_pools_, stream,
+                  rows.decode ? -1 : (rows.pos0 + T) / kpool_);
+  qsa_select_from_keys(keys_ws_, max_pools_, d_pos, T, select_k_, kpool_, max_selected_, topk_,
+                       counts_, stream);
   // Small grids do not amortize the wider head group. Keep decode/verify and
   // short prefills on their existing kernel; both paths use identical arithmetic.
   // Long prefill walks take the one-warp tensor-core kernel
@@ -644,15 +626,10 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
                           cache.blocks_per_request, scale_, c_out_, stream);
   } else {
     const auto attend = !rows.decode && T >= 128 ? qsa_attn_prefill_partial : qsa_attn_partial;
-    for (int first = 0; first < T; first += work_rows_) {
-      const int count = std::min(work_rows_, T - first);
-      attend(qn_ + static_cast<int64_t>(first) * lh_ * D, static_cast<int64_t>(lh_) * D,
-             cache.k_cache, cache.v_cache, d_req + first, topk_ + static_cast<int64_t>(first) * max_selected_,
-             max_selected_, counts_ + first, count, n_split_, lh_, lkv_, D, cache.block_tokens,
-             cache.block_tables, cache.blocks_per_request, scale_, m_ws_, l_ws_, c_ws_, stream);
-      dsa_attn_combine(m_ws_, l_ws_, c_ws_, count, n_split_, lh_, D,
-                       c_out_ + static_cast<int64_t>(first) * lh_ * D, stream);
-    }
+    attend(qn_, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, topk_,
+           max_selected_, counts_, T, n_split_, lh_, lkv_, D, cache.block_tokens,
+           cache.block_tables, cache.blocks_per_request, scale_, m_ws_, l_ws_, c_ws_, stream);
+    dsa_attn_combine(m_ws_, l_ws_, c_ws_, T, n_split_, lh_, D, c_out_, stream);
   }
   qsa_gate_out(c_out_, q_ + D, QW, 2 * D, o_, T, lh_, D, stream);
   gemm_dense(g_, o_, static_cast<int64_t>(lh_) * D, w_.o_proj, w_.o_proj_fp8, out, GemmOut::BF16, T, H,
@@ -669,10 +646,9 @@ size_t QwenQsaLayer::scratch_bytes(const QwenTextConfig& cfg, int local_heads, i
   const size_t n_split = static_cast<size_t>(std::max<size_t>(1, std::min<size_t>(8, (max_selected + 255) / 256)));
   size_t b = 0;
   b += M * (lh * 2 * D + 2 * lkv * D + lh * D + lkv * D + (nH + 1) * Di + nH * Di) * 2;  // q, k, v, qn, kn, idx, qi
-  b += static_cast<size_t>(qsa_work_rows(max_tokens)) * static_cast<size_t>(std::max<int64_t>(max_pools, 0)) * 8;                    // keys_ws
+  b += M * static_cast<size_t>(std::max<int64_t>(max_pools, 0)) * 8;                    // keys_ws
   b += M * max_selected * 4 + M * 4;                                                    // topk, counts
-  const size_t work_rows = static_cast<size_t>(qsa_work_rows(max_tokens));
-  b += 2 * work_rows * n_split * lh * 4 + work_rows * n_split * lh * D * 4;                             // m, l, c partials
+  b += 2 * M * n_split * lh * 4 + M * n_split * lh * D * 4;                             // m, l, c partials
   b += M * lh * D * 4 + M * lh * D * 2;                                                 // c_out, o
   return b;
 }
