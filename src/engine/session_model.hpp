@@ -387,7 +387,8 @@ class SessionModel : public PrefillReporting {
   void write_snapshot(int req, void* dst, int spec_row);
   SessionSnapshotMeta pin_blocks_at(int req, int64_t pos, const char* what);
   // The draft block's rows.
-  void mtp_prefill_rows(int req, int64_t row0, int64_t row1, const int64_t* tokens);
+  void mtp_prefill_rows(int req, int64_t row0, int64_t row1, const int64_t* tokens,
+                       int hidden_row_offset = 0);
   void mtp_decode_host_prep(int req, const std::vector<int64_t>& tokens, bool upload);
   // The draft block's input window per slot ([R][max_decode_rows_][draft_width]).
   uint16_t* mtp_window(int req) const {
@@ -1011,7 +1012,7 @@ std::vector<typename SessionModel<D>::Outputs> SessionModel<D>::session_prefill_
     push_position(req);
     if (mtp_) {
       // The draft block over the span's rows (row q embeds tok_{q+1}).
-      if (P - 1 > 0) mtp_prefill_rows(req, 0, P - 1, ids.data() + at + 1);
+      if (P - 1 > 0) mtp_prefill_rows(req, 0, P - 1, ids.data() + at + 1, static_cast<int>(at));
       mtp_pos_[static_cast<size_t>(req)] = std::max<int64_t>(P - 1, 0);
       push_mtp_position(req);
     }
@@ -1582,15 +1583,21 @@ void SessionModel<D>::session_graph_capture_verify_next_tokens_batch(const PickV
 // ---- the MTP draft block ------------------------------------------------------
 
 template <class D>
-void SessionModel<D>::mtp_prefill_rows(int req, int64_t row0, int64_t row1, const int64_t* tokens) {
+void SessionModel<D>::mtp_prefill_rows(int req, int64_t row0, int64_t row1, const int64_t* tokens,
+                                      int hidden_row_offset) {
   const int64_t n = row1 - row0;
   if (n <= 0) return;
   if (n > max_tokens_) throw std::invalid_argument("mtp_prefill_rows: chunk too long");
   DGPP_CUDA_OK(cudaMemcpyAsync(d_tokens_, tokens, static_cast<size_t>(n) * 8, cudaMemcpyHostToDevice, stream_));
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   if constexpr (requires { derived().mtp_select_block(0); }) derived().mtp_select_block(0);
-  derived().mtp_run_rows(req, d_tokens_, row0, static_cast<int>(n), /*decode_row=*/false, /*capture=*/false,
-                         /*head_rows=*/0, /*batch_requests=*/0);
+  if constexpr (requires { derived().mtp_run_rows(req, d_tokens_, row0, static_cast<int>(n),
+                                                  false, false, 0, 0, hidden_row_offset); }) {
+    derived().mtp_run_rows(req, d_tokens_, row0, static_cast<int>(n), false, false, 0, 0,
+                           hidden_row_offset);
+  } else {
+    derived().mtp_run_rows(req, d_tokens_, row0, static_cast<int>(n), false, false, 0, 0);
+  }
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
 }
 

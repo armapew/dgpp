@@ -202,7 +202,7 @@ class QwenModel : public SessionModel<QwenModel> {
   bool session_prefill_advance(PrefillCursor& cursor, int64_t chunk_tokens = 0);
   void graph_prepare();
   void mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, int T, bool decode_row,
-                    bool capture, int head_rows, int batch_requests);
+                    bool capture, int head_rows, int batch_requests, int prefill_row_offset = 0);
   void snapshot_draft_state(int req);
   void restore_draft_state(int req);
   // Depth >= 2: the chain rows run the draft block forward

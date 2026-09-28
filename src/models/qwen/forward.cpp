@@ -878,8 +878,15 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
   // windows by position (the last window rows of a prefill chunk, every
   // decode row — distinct slots within one launch).
   if (mtp_) {
-    const int n = run.num_spans > 0 ? T : std::min(T, max_decode_rows_);  // a group prefill stores every row
-    store_draft_hidden(r_ + static_cast<size_t>(T - n) * W, d_req + (T - n), d_pos + (T - n), n);
+    // Each request owns a circular window. Storing every grouped row races
+    // when a span is longer than the window: older rows alias newer rows.
+    int end = 0;
+    for (int s = 0; s < std::max(1, run.num_spans); ++s) {
+      const int length = run.num_spans > 0 ? run.span_lens[s] : T;
+      end += length;
+      const int n = std::min(length, max_decode_rows_);
+      store_draft_hidden(r_ + static_cast<size_t>(end - n) * W, d_req + (end - n), d_pos + (end - n), n);
+    }
   }
   // The prefetch side stream rejoins here: a capture must end with every
   // forked stream joined, and the eager tail's sync (finish_run) covers
@@ -1165,7 +1172,7 @@ size_t QwenModel::bf12_plan_bytes(const QwenTextConfig& cfg, const QwenLocalGeom
 // then its own mixer and the shared head.
 // ---------------------------------------------------------------------------
 void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, int T, bool decode_row,
-                             bool capture, int head_rows, int batch_requests) {
+                             bool capture, int head_rows, int batch_requests, int prefill_row_offset) {
   walk_rows_ = T;
   // The hidden projection has T * hc matrix rows: a shipped 6/8-token
   // walk must not enter the wide guard just because hc expands it to 24/32.
@@ -1185,7 +1192,9 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
   // ---- the input fusion --------------------------------------------------
   // Decode rows gather their hyper states from the slots' windows by
   // position; prefill rows read the main chunk's rows in place (r_).
-  const uint16_t* hin = r_;
+  // A grouped main walk leaves every span in r_. The draft must consume
+  // this request's rows, not the first span's rows.
+  const uint16_t* hin = r_ + static_cast<size_t>(prefill_row_offset) * W;
   if (decode_row) {
     gather_draft_hidden(d_req, d_pos, mtp_hin_, T);
     hin = mtp_hin_;
