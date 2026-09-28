@@ -636,7 +636,7 @@ DGPP_TEST(qsa_query_tiles_preserve_keys_selections_and_graph_replay) {
   constexpr int qstride = 4 * dim + 8;
   cudaStream_t stream = test_stream();
   for (int context : {2053, 100003, 200003, 524287}) {
-    for (int rows : {2, 4, 8, context == 2053 ? 4099 : 19}) {
+    for (int rows : {1, 2, 4, 8, context == 2053 ? 4099 : 19}) {
     const int visible_max = context / kpool;
     const int stride = visible_max + 7;
     const int blocks = (stride + ppb - 1) / ppb;
@@ -660,7 +660,7 @@ DGPP_TEST(qsa_query_tiles_preserve_keys_selections_and_graph_replay) {
         DGPP_CUDA_OK(cudaMemsetAsync(keys.p, 0xa5, keys.bytes, stream));
         dgpp::qsa_index_score(ptr<uint16_t>(dq), qstride, ptr<int32_t>(dr), ptr<int64_t>(dp),
             rows, ptr<int32_t>(dt), blocks, ptr<uint16_t>(dc), ppb, heads, dim, kpool,
-            mptr<uint64_t>(keys) + guard, stride, stream, visible_max, tile);
+            mptr<uint64_t>(keys) + guard, stride, stream, rows <= 32 ? -1 : visible_max, tile);
         dgpp::qsa_select_from_keys(ptr<uint64_t>(keys) + guard, stride, ptr<int64_t>(dp),
             rows, select_k, kpool, width, mptr<int32_t>(selected), mptr<int32_t>(counts), stream);
       };

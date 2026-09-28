@@ -283,7 +283,7 @@ __global__ __launch_bounds__(kScoreThreads) void index_score_kernel(
 // Several neighboring queries can share an index-key load and conversion.
 // Each query keeps the scalar kernel's FMA chain and reduction tree. Tiles
 // crossing request boundaries use independent loads; positions remain per row.
-template <int Queries>
+template <int Queries, int PoolsPerBlock = kScorePoolsPerBlock>
 __global__ __launch_bounds__(kScoreThreads) void index_score_query_tile_kernel(
     const uint16_t* __restrict__ q, int64_t q_row_stride, const int32_t* __restrict__ req_ids,
     const int64_t* __restrict__ pos, int rows, const int32_t* __restrict__ block_tables,
@@ -306,7 +306,7 @@ __global__ __launch_bounds__(kScoreThreads) void index_score_query_tile_kernel(
       else same_request &= shared_request == requests[i];
     }
   }
-  const int64_t p0 = static_cast<int64_t>(blockIdx.x) * kScorePoolsPerBlock;
+  const int64_t p0 = static_cast<int64_t>(blockIdx.x) * PoolsPerBlock;
   if (p0 >= max_visible) return;
   for (int x = threadIdx.x; x < Queries * 4 * 128; x += kScoreThreads) {
     const int i = x / (4 * 128), d = x % (4 * 128);
@@ -318,7 +318,7 @@ __global__ __launch_bounds__(kScoreThreads) void index_score_query_tile_kernel(
   const int h = lane >> 3, c = lane & 7;
   if (same_request) {
     const int32_t* bt = block_tables + static_cast<int64_t>(shared_request) * blocks_per_request;
-    const int64_t p1 = min(max_visible, p0 + kScorePoolsPerBlock);
+    const int64_t p1 = min(max_visible, p0 + PoolsPerBlock);
     for (int64_t pool = p0 + warp; pool < p1; pool += kScoreWarps) {
       const int32_t blk = bt[pool / pools_per_block];
       const int64_t slot = static_cast<int64_t>(blk) * pools_per_block + pool % pools_per_block;
@@ -357,7 +357,7 @@ __global__ __launch_bounds__(kScoreThreads) void index_score_query_tile_kernel(
     for (int i = 0; i < Queries; ++i) {
       if (p0 >= visible[i]) continue;
       const int32_t* bt = block_tables + static_cast<int64_t>(requests[i]) * blocks_per_request;
-      const int64_t p1 = min(visible[i], p0 + kScorePoolsPerBlock);
+      const int64_t p1 = min(visible[i], p0 + PoolsPerBlock);
       const float* qr = qs + i * 4 * 128 + h * 128 + c * 16;
       for (int64_t pool = p0 + warp; pool < p1; pool += kScoreWarps) {
         const int32_t blk = bt[pool / pools_per_block];
@@ -826,13 +826,21 @@ void qsa_index_score(const uint16_t* q, int64_t q_row_stride, const int32_t* req
     throw std::invalid_argument("qsa_index_score: query_tile must be 1, 2, 4 or 8");
   const int64_t pools = visible_pool_bound < 0 ? ws_stride : visible_pool_bound;
   if (pools == 0) return;
-  const int64_t stripes = (pools + kScorePoolsPerBlock - 1) / kScorePoolsPerBlock;
+  // Two queries double each block's work. A half-width stripe retains the
+  // original block count for the small dynamic-position decode envelope.
+  const bool decode_pair = query_tile == 2 && rows <= 32 && visible_pool_bound < 0;
+  const int stripe_pools = decode_pair ? kScorePoolsPerBlock / 2 : kScorePoolsPerBlock;
+  const int64_t stripes = (pools + stripe_pools - 1) / stripe_pools;
   if (stripes > 0x7fffffff) throw std::invalid_argument("qsa_index_score: too many pools");
   const dim3 grid(static_cast<unsigned>(stripes), static_cast<unsigned>((rows + query_tile - 1) / query_tile));
   const float sqrt_dim = std::sqrt(static_cast<float>(dim));
   if (query_tile == 1) {
     index_score_kernel<<<grid, kScoreThreads, 0, stream>>>(
         q, q_row_stride, req_ids, pos, block_tables, blocks_per_request, index_cache,
+        pools_per_block, heads, kpool, keys_ws, ws_stride, sqrt_dim);
+  } else if (decode_pair) {
+    index_score_query_tile_kernel<2, kScorePoolsPerBlock / 2><<<grid, kScoreThreads, 0, stream>>>(
+        q, q_row_stride, req_ids, pos, rows, block_tables, blocks_per_request, index_cache,
         pools_per_block, heads, kpool, keys_ws, ws_stride, sqrt_dim);
   } else if (query_tile == 2) {
     index_score_query_tile_kernel<2><<<grid, kScoreThreads, 0, stream>>>(
