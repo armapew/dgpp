@@ -897,6 +897,19 @@ void QwenNgramTableMmap::gather(const int32_t* ids, int n, int heads, int head_b
       std::memcpy(dst + static_cast<size_t>(pair) * head_dim_, row(id), static_cast<size_t>(head_dim_));
     }
   };
+  if (staged_gather_ && total <= 256) {
+    // Decode gathers are tiny: exact page advice needs no sorting, allocation
+    // or worker wakeup. Preserve the scalar copy path.
+    const uintptr_t mask = ~(static_cast<uintptr_t>(page_bytes_) - 1);
+    for (int64_t pair = 0; pair < total; ++pair) {
+      const int64_t t = pair / heads_local, hl = pair - t * heads_local;
+      const uintptr_t p = reinterpret_cast<uintptr_t>(row(ids[t * heads + head_begin + hl]));
+      const uintptr_t first = p & mask, last = (p + head_dim_ - 1) & mask;
+      madvise(reinterpret_cast<void*>(first), last - first + page_bytes_, MADV_WILLNEED);
+    }
+    copy_range(0, total);
+    return;
+  }
   if (staged_gather_) {
     std::vector<uintptr_t> pages;
     pages.reserve(static_cast<size_t>(total) * 2);
@@ -921,8 +934,7 @@ void QwenNgramTableMmap::gather(const int32_t* ids, int n, int heads, int head_b
       madvise(reinterpret_cast<void*>(begin), end - begin, MADV_WILLNEED);
     }
     // Every index was checked above; workers only copy immutable, valid rows.
-    if (total <= 256) copy_range(0, total);
-    else gather_pool_->run(total, copy_range);
+    gather_pool_->run(total, copy_range);
     return;
   }
   for (int64_t pair = 0; pair < total; ++pair) {
