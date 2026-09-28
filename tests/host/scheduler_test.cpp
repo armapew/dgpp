@@ -562,6 +562,32 @@ DGPP_TEST(scheduler_coalesces_only_matching_cold_prefixes_and_bounds_work) {
   }
 }
 
+DGPP_TEST(scheduler_prefix_coalescing_waits_for_a_shared_system_head_only) {
+  CoalesceEnv env;
+  CoalesceEngine engine;
+  engine.prefill_lookahead_ = true;
+  dgpp::sched::AdmissionPolicy policy;
+  policy.prefill_budget_tokens = 4096;
+  policy.prefix_head_snapshots = true;
+  policy.prefix_min_tokens = 1024;
+  Scheduler sched(&engine, {}, 0, policy);
+  for (int i = 0; i < 4; ++i) {
+    auto r = make_request("head" + std::to_string(i), 13001, 1);
+    r.boundaries = {8192, 13000};
+    r.prompt[9000] = i + 20;  // neither the deepest nor the body cut matches
+    sched.submit(std::move(r));
+  }
+  sched.tick();
+  require(sched.meters().prefilling == 1 && sched.meters().queued == 3,
+          "followers wait for the pending system head snapshot");
+  sched.run_to_completion();
+  require(sched.meters().prompt_tokens_computed == 13001 + 3 * (13001 - 8192),
+          "the completed system head serves all three followers");
+  require(sched.meters().pool_blocks_in_use == sched.meters().prefix_blocks_pinned,
+          "head dependencies leave no active reservations");
+  for (const auto& result : sched.results()) require(result.steps_done == 1, "all head followers finish");
+}
+
 DGPP_TEST(scheduler_prefix_coalescing_releases_cancelled_dependencies_and_bypasses_unrelated_work) {
   for (int cancel : {0, 1}) {
     CoalesceEnv env;
