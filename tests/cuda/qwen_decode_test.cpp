@@ -151,6 +151,42 @@ int audit(QwenModel& ref, const std::vector<int64_t>& prompt, const Transcript& 
 
 // The prefill head must match the diagnostic full head across the GEMV/dense
 // transition. A one-row GEMV substitution fails this gate for long prompts.
+int run_grouped_mtp(const std::string& dir) {
+  const auto cfg = QwenTextConfig::from_json_file((fs::path(dir) / "config.json").string());
+  QwenModel solo(cfg, dir, 512, 2048, QwenResidency::Resident, nullptr, 0, 1, 4, true, 24);
+  QwenModel grouped(cfg, dir, 512, 2048, QwenResidency::Resident, nullptr, 0, 1, 4, true, 24);
+  const int V = solo.lm_vocab_count();
+  for (const int count : {2, 4}) {
+    std::vector<std::vector<int64_t>> prompts;
+    std::vector<int> reqs;
+    for (int i = 0; i < count; ++i) {
+      prompts.push_back(smoke_tokens(cfg, 97 - 8 * i, 0x1b5200 + 7123 * i));
+      reqs.push_back(count - i - 1);
+    }
+    std::vector<const std::vector<int64_t>*> ptrs;
+    std::vector<QwenModel::Outputs> reference;
+    for (int i = 0; i < count; ++i) {
+      ptrs.push_back(&prompts[i]);
+      reference.push_back(solo.session_prefill(reqs[i], prompts[i]));
+    }
+    const auto actual = grouped.session_prefill_group(reqs, ptrs);
+    for (int i = 0; i < count; ++i) {
+      const auto target = compare_row(actual[i].logits.data(), reference[i].logits.data(), V);
+      require(target.l2 < 0.1, "grouped target exceeds the existing prefill l2 budget");
+      const int64_t token = argmax(reference[i].logits.data(), V);
+      const auto want = solo.session_draft(reqs[i], {token});
+      const auto got = grouped.session_draft(reqs[i], {token});
+      const auto draft = compare_row(got.logits.data(), want.logits.data(), V);
+      std::printf("[ .. ] grouped MTP C%d span %d: target l2 %.6g, draft l2 %.6g\n",
+                  count, i, target.l2, draft.l2);
+      require(draft.l2 < 0.1, "grouped draft exceeds the existing prefill l2 budget");
+      solo.session_close(reqs[i]);
+      grouped.session_close(reqs[i]);
+    }
+  }
+  return 0;
+}
+
 int run_dense_cache(const std::string& dir) {
   const auto cfg = QwenTextConfig::from_json_file((fs::path(dir) / "config.json").string());
   const char* previous = std::getenv("DGPP_DENSE_CACHE_MIB");
@@ -1019,7 +1055,7 @@ int run_checkpoint(const std::string& dir, const std::vector<int64_t>& ids, int 
 
 int main(int argc, char** argv) {
   std::string fixture, checkpoint, ids_text;
-  bool fp8_head = false, prefill_head = false, dense_cache = false;
+  bool fp8_head = false, prefill_head = false, dense_cache = false, grouped_mtp = false;
   int steps = 4;
   int layers_extra = -1;
   for (int i = 1; i < argc; ++i) {
@@ -1031,12 +1067,15 @@ int main(int argc, char** argv) {
       prefill_head = true;
     else if (a == "--dense-cache")
       dense_cache = true;
+    else if (a == "--grouped-mtp")
+      grouped_mtp = true;
     else if (a == "--checkpoint-dir" && i + 1 < argc) checkpoint = argv[++i];
     else if (a == "--ids" && i + 1 < argc) ids_text = argv[++i];
     else if (a == "--steps" && i + 1 < argc) steps = std::stoi(argv[++i]);
     else if (a == "--layers" && i + 1 < argc) layers_extra = std::stoi(argv[++i]);
   }
   try {
+    if (!fixture.empty() && grouped_mtp) return run_grouped_mtp(fixture);
     if (!fixture.empty()) return dense_cache ? run_dense_cache(fixture) :
         (prefill_head ? run_prefill_head(fixture) : run_fixture(fixture, fp8_head));
     if (!checkpoint.empty()) {
