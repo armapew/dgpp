@@ -408,6 +408,36 @@ SchedulerRequest make_request(const std::string& id, int prompt_len,
   return r;
 }
 
+DGPP_TEST(scheduler_layer_yield_defers_pending_retirement_without_partial_replay) {
+  struct YieldEngine : FakeEngine {
+    YieldEngine() : FakeEngine(3, 128, 64, 3) {}
+    std::function<bool(bool)> yield;
+    void set_prefill_yield_hook(std::function<bool(bool)> hook) override { yield = std::move(hook); }
+  };
+  for (bool stop : {false, true}) {
+    YieldEngine engine;
+    std::vector<int32_t> a, b;
+    for (int i=0;i<16;++i) { a.push_back(100+i); b.push_back(200+i); }
+    engine.arm(0,a,16); engine.arm(1,b,16);
+    {
+      Scheduler sched(&engine, {}, 0);
+      sched.submit(make_request("a",4,16)); sched.tick();
+      sched.submit(make_request("b",4,16)); sched.tick();
+      require(engine.yield && engine.yield(false), "active peers permit a layer yield");
+      const auto before = engine.batch_calls().size();
+      require(stop ? sched.stop("a") : sched.cancel("a"), "live peer can retire");
+      require(!engine.yield(false) && !engine.yield(true), "pending retirement defers physical replay");
+      require(engine.batch_calls().size() == before, "no partial live batch executed");
+      sched.tick();
+      require(engine.yield(false) && engine.yield(true), "remaining peer resumes after retirement sweep");
+      sched.run_to_completion();
+      require(sched.find("b")->generated == std::vector<int64_t>(b.begin(),b.end()), "peer transcript is intact");
+      require(sched.meters().pool_blocks_in_use == 0, "all reservations released");
+    }
+    require(!engine.yield, "scheduler releases its callback before destruction");
+  }
+}
+
 // EOS id used by every script (token 999 in the streams).
 constexpr int32_t kEos = 999;
 
