@@ -7,6 +7,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <thread>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <unordered_map>
 #include <algorithm>
 #include <vector>
@@ -770,10 +773,72 @@ bool QwenLayerStream::mtp_experts_bf16_fused() { return g_mtp_experts_bf16_fused
 
 // ---- QwenNgramTableMmap ---------------------------------------------------------
 
+// Reuse the staging workers across chunks. A submission owns its input/output
+// until all workers have completed; concurrent gathers serialize submissions.
+struct QwenNgramTableMmap::GatherPool {
+  std::mutex submit_mutex, mutex;
+  std::condition_variable ready, done;
+  std::vector<std::thread> threads;
+  std::function<void(int64_t, int64_t)> copy;
+  uint64_t generation = 0;
+  int active = 0, pending = 0;
+  int64_t total = 0, span = 0;
+  bool stop = false;
+  GatherPool() {
+    try {
+      for (int id = 0; id < 16; ++id) threads.emplace_back([this, id] {
+        uint64_t observed = 0;
+        std::unique_lock lock(mutex);
+        for (;;) {
+          ready.wait(lock, [&] { return stop || generation != observed; });
+          if (stop) return;
+          observed = generation;
+          if (id >= active) continue;
+          const int64_t lo = id * span, hi = std::min(total, lo + span);
+          lock.unlock();
+          copy(lo, hi);
+          lock.lock();
+          if (--pending == 0) done.notify_one();
+        }
+      });
+    } catch (...) {
+      shutdown();
+      throw;
+    }
+  }
+  void shutdown() {
+    { std::lock_guard lock(mutex); stop = true; }
+    ready.notify_all();
+    for (auto& thread : threads) if (thread.joinable()) thread.join();
+  }
+  ~GatherPool() { shutdown(); }
+  void run(int64_t count, const std::function<void(int64_t, int64_t)>& fn) {
+    std::lock_guard submit(submit_mutex);
+    std::unique_lock lock(mutex);
+    total = count;
+    active = static_cast<int>(std::min<int64_t>(threads.size(), (total + 255) / 256));
+    pending = active;
+    span = (total + active - 1) / active;
+    copy = fn;
+    ++generation;
+    ready.notify_all();
+    done.wait(lock, [&] { return pending == 0; });
+    copy = {};
+  }
+};
+
 QwenNgramTableMmap::QwenNgramTableMmap(std::vector<Part> parts, int64_t capacity, int head_dim)
     : parts_(std::move(parts)), capacity_(capacity), head_dim_(head_dim) {
   if (capacity_ <= 0 || head_dim_ <= 0 || parts_.empty())
     throw std::invalid_argument("QwenNgramTableMmap: empty geometry");
+  const char* staging = std::getenv("DGPP_NGRAM_STAGING");
+  if (staging && *staging && std::string(staging) != "0" && std::string(staging) != "1")
+    throw std::invalid_argument("DGPP_NGRAM_STAGING must be 0 or 1");
+  staged_gather_ = staging && std::string(staging) == "1";
+  page_bytes_ = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+  if (page_bytes_ == 0 || (page_bytes_ & (page_bytes_ - 1)) != 0)
+    throw std::runtime_error("QwenNgramTableMmap: unsupported page size");
+  if (staged_gather_) gather_pool_ = std::make_unique<GatherPool>();
   std::unordered_map<std::string, size_t> by_path;
   part_base_.resize(parts_.size(), nullptr);
   for (size_t s = 0; s < parts_.size(); ++s) {
@@ -804,6 +869,7 @@ QwenNgramTableMmap::QwenNgramTableMmap(std::vector<Part> parts, int64_t capacity
 }
 
 QwenNgramTableMmap::~QwenNgramTableMmap() {
+  gather_pool_.reset();
   for (Mapping& m : maps_) {
     if (m.base) munmap(m.base, m.len);
     if (m.fd >= 0) ::close(m.fd);
@@ -831,6 +897,34 @@ void QwenNgramTableMmap::gather(const int32_t* ids, int n, int heads, int head_b
       std::memcpy(dst + static_cast<size_t>(pair) * head_dim_, row(id), static_cast<size_t>(head_dim_));
     }
   };
+  if (staged_gather_) {
+    std::vector<uintptr_t> pages;
+    pages.reserve(static_cast<size_t>(total) * 2);
+    const uintptr_t mask = ~(static_cast<uintptr_t>(page_bytes_) - 1);
+    for (int64_t pair = 0; pair < total; ++pair) {
+      const int64_t t = pair / heads_local, hl = pair - t * heads_local;
+      const uintptr_t p = reinterpret_cast<uintptr_t>(row(ids[t * heads + head_begin + hl]));
+      const uintptr_t first = p & mask, last = (p + head_dim_ - 1) & mask;
+      for (uintptr_t page = first;; page += page_bytes_) {
+        pages.push_back(page);
+        if (page == last) break;
+      }
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    for (size_t i = 0; i < pages.size();) {
+      const uintptr_t begin = pages[i++];
+      uintptr_t end = begin + page_bytes_;
+      while (i < pages.size() && pages[i] == end && end - begin < 65536) {
+        ++i; end += page_bytes_;
+      }
+      madvise(reinterpret_cast<void*>(begin), end - begin, MADV_WILLNEED);
+    }
+    // Every index was checked above; workers only copy immutable, valid rows.
+    if (total <= 256) copy_range(0, total);
+    else gather_pool_->run(total, copy_range);
+    return;
+  }
   for (int64_t pair = 0; pair < total; ++pair) {
     const int64_t t = pair / heads_local, hl = pair - t * heads_local;
     const uint8_t* p = row(ids[t * heads + head_begin + hl]);

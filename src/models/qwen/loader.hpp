@@ -190,6 +190,10 @@ class QwenNgramTableMmap {
   size_t mapped_bytes() const { return mapped_bytes_; }
 
  private:
+  struct GatherPool;
+  std::unique_ptr<GatherPool> gather_pool_;
+  bool staged_gather_ = false;
+  size_t page_bytes_ = 4096;
   struct Mapping {
     int fd = -1;
     uint8_t* base = nullptr;

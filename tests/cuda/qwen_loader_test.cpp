@@ -12,9 +12,11 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -435,6 +437,55 @@ DGPP_TEST(qwen_loader_mmap_ngram_table_reads_the_shards_rows) {
         }
     }
   }
+}
+
+DGPP_TEST(qwen_loader_staged_ngram_gather_preserves_bytes_and_concurrent_submissions) {
+  const char* old = std::getenv("DGPP_NGRAM_STAGING");
+  struct Restore {
+    bool had; std::string value;
+    ~Restore() { if (had) setenv("DGPP_NGRAM_STAGING", value.c_str(), 1); else unsetenv("DGPP_NGRAM_STAGING"); }
+  } restore{old != nullptr, old ? old : ""};
+  constexpr int capacity = 1025, hd = 160, heads = 16;
+  const fs::path path = fs::current_path() / "qwen_ngram_staging_fixture.bin";
+  // Unaligned shard offsets, crossing records, final partial pages and two
+  // parts of the same mapping exercise the page-range calculation.
+  std::vector<uint8_t> file(73 + 2 * capacity * hd);
+  for (size_t i = 0; i < file.size(); ++i) file[i] = static_cast<uint8_t>((i * 17 + i / 257) % 251);
+  { std::ofstream out(path, std::ios::binary); out.write(reinterpret_cast<const char*>(file.data()), file.size()); }
+  for (int staged : {0, 1}) {
+    setenv("DGPP_NGRAM_STAGING", staged ? "1" : "0", 1);
+    dgpp::QwenNgramTableMmap table({{path.string(), 73, capacity},
+                                  {path.string(), 73 + capacity * hd, capacity}}, capacity, hd);
+    const auto check = [&](int n, int begin, int local) {
+      std::vector<int32_t> ids(size_t(n) * heads);
+      for (size_t i = 0; i < ids.size(); ++i) ids[i] = (i % 3 == 0 ? 2 * capacity - 1 : (i * 997) % (2 * capacity));
+      constexpr size_t guard = 31;
+      std::vector<uint8_t> out(size_t(n) * local * hd + 2 * guard, 0xa5);
+      table.gather(ids.data(), n, heads, begin, local, out.data() + guard);
+      for (int t = 0; t < n; ++t) for (int h = 0; h < local; ++h)
+        require(std::memcmp(out.data() + guard + (size_t(t) * local + h) * hd,
+                            file.data() + 73 + size_t(ids[size_t(t) * heads + begin + h]) * hd, hd) == 0,
+                "staging changed an embedding record");
+      for (size_t i = 0; i < guard; ++i)
+        require(out[i] == 0xa5 && out[out.size() - 1 - i] == 0xa5, "staging overwrote output guards");
+    };
+    for (int n : {1, 17, 257, 4096}) { check(n, 0, heads); check(n, 4, 8); }
+    if (staged) {
+      std::exception_ptr failures[2];
+      std::thread a([&] { try { for (int i = 0; i < 4; ++i) check(1024, 0, 16); } catch (...) { failures[0] = std::current_exception(); } });
+      std::thread b([&] { try { for (int i = 0; i < 4; ++i) check(513, 8, 8); } catch (...) { failures[1] = std::current_exception(); } });
+      a.join(); b.join();
+      for (auto error : failures) if (error) std::rethrow_exception(error);
+      std::vector<int32_t> ids(17 * heads, 2 * capacity);
+      std::vector<uint8_t> out(ids.size() * hd);
+      bool threw = false;
+      try { table.gather(ids.data(), 17, heads, 0, heads, out.data()); }
+      catch (const std::exception&) { threw = true; }
+      require(threw, "invalid row accepted by staging workers");
+      check(257, 0, heads);
+    }
+  }
+  fs::remove(path);
 }
 
 DGPP_TEST(qwen_loader_nvfp4_metadata_is_replicated_at_world_two) {
