@@ -379,10 +379,12 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
   struct Restore {
     bool had; std::string value;
     bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
+    bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();
     ~Restore() {
       if (had) setenv("DGPP_BATCH_PREFILL", value.c_str(), 1);
       else unsetenv("DGPP_BATCH_PREFILL");
       dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
+      dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
     }
   } restore{old != nullptr, old ? old : ""};
   setenv("DGPP_BATCH_PREFILL", "1", 1);
@@ -392,7 +394,11 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
   qwenfx::write_fixture(cfg, dir, qwenfx::tiny_text_json(), qwenfx::tiny_nvfp4_quant_json());
   std::vector<std::vector<int64_t>> prompts;
   for (int i = 0; i < 4; ++i) prompts.push_back(smoke_tokens(cfg, 73 + i * 12, 7138 + i * 7919));
+  std::vector<std::vector<int32_t>> reference[6];
+  for (bool mapped : {false, true}) {
+  dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
   for (int depth : {1, 2, 5}) {
+    std::vector<std::vector<int32_t>> observed(4);
     auto buses = start_world(1, kPort + 29);
     require(buses.size() == 1, "grouped continuation world-of-one bus");
     QwenModel model(cfg, dir, 128, 2048, QwenResidency::Resident, nullptr, 0, 1, 4, true,
@@ -432,6 +438,7 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
               if (progress[i].first_token >= 0) {
                 require(round != 0 || progress[i].snap_taken, "each grouped snapshot is committed");
                 require(round != 0 || progress[i].head_snap_taken, "each grouped head snapshot is committed");
+                observed[req].push_back(progress[i].first_token);
                 counts[req] = 1;
                 active.push_back(req);
                 graph.reserve(req, 256);
@@ -445,6 +452,7 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
             for (size_t i = 0; i < active.size(); ++i) {
               const int req = active[i];
               require(!tokens[i].empty(), "graph decode makes progress beside grouped prefill");
+              observed[req].insert(observed[req].end(), tokens[i].begin(), tokens[i].end());
               counts[req] += static_cast<int>(tokens[i].size());
               if (counts[req] >= 16) graph.close(req);
               else remaining.push_back(req);
@@ -459,9 +467,12 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
       graph.drain();
       require(graph.pool_blocks_in_use() == 0, "grouped cache lifecycle releases all blocks");
     }
+    if (!mapped) reference[depth] = observed;
+    else require(observed == reference[depth], "mmap staging changed graph/cache/MTP transcripts");
     DGPP_CUDA_OK(cudaFreeHost(scratch));
-    std::printf("[ OK ] grouped cold/cached graph continuations, four slots, MTP depth %d\n", depth);
+    std::printf("[ OK ] grouped cold/cached graph continuations, four slots, MTP depth %d, mmap %d\n", depth, mapped);
   }
+}
 }
 
 DGPP_TEST(qwen_pending_body_retarget_matches_a_preplanned_snapshot_with_mtp) {
