@@ -618,7 +618,10 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
     p[1].payload = w_.k_proj_fp8.payload; p[1].scales = w_.k_proj_fp8.scales; p[1].out = k_; p[1].n = KW;
     p[2].payload = w_.v_proj_fp8.payload; p[2].scales = w_.v_proj_fp8.scales; p[2].out = v_; p[2].n = KW;
     p[3].payload = w_.index_qk_proj_fp8.payload; p[3].scales = w_.index_qk_proj_fp8.scales; p[3].out = idx_; p[3].n = IW;
-    launch_scale_gemv_multi_bf16(p, 4, x, static_cast<size_t>(H), T, H, stream);
+    launch_scale_gemv_multi_bf16(p, w_.index_qk_proj_fp8.payload ? 4 : 3,
+                                x, static_cast<size_t>(H), T, H, stream);
+    if (!w_.index_qk_proj_fp8.payload)
+      gemm_dense(g_, x, H, w_.index_qk_proj, {}, idx_, GemmOut::BF16, T, IW, H, stream);
   } else {
     gemm_dense(g_, x, H, w_.q_proj, w_.q_proj_fp8, q_, GemmOut::BF16, T, QW, H, stream);
     gemm_dense(g_, x, H, w_.k_proj, w_.k_proj_fp8, k_, GemmOut::BF16, T, KW, H, stream);

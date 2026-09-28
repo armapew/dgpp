@@ -7,6 +7,7 @@
 // bytes read; the globals and the n-gram table slice; resident cache hits
 // and the image round trip; and a tampered hash buffer is refused.
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -478,6 +479,61 @@ DGPP_TEST(qwen_loader_nvfp4_activation_scales_survive_image_restore) {
     }
   }
   QwenLayerStream::set_resident_image_dir(saved);
+  fs::remove_all(cache);
+}
+
+DGPP_TEST(qwen_loader_bf16_indexer_has_distinct_images_and_checkpoint_bytes) {
+  const Fixture fx = write_nvfp4_fixture();
+  const fs::path cache = fs::current_path() / "qwen_loader_indexer_precision_cache";
+  fs::remove_all(cache);
+  const char* old = std::getenv("DGPP_QSA_INDEXER_BF16");
+  struct Restore {
+    bool had, fp8; std::string value, directory;
+    ~Restore() {
+      if (had) setenv("DGPP_QSA_INDEXER_BF16", value.c_str(), 1);
+      else unsetenv("DGPP_QSA_INDEXER_BF16");
+      QwenLayerStream::set_dense_weights_fp8(fp8);
+      QwenLayerStream::set_resident_image_dir(directory);
+    }
+  } restore{old != nullptr, QwenLayerStream::dense_weights_fp8(), old ? old : "",
+            QwenLayerStream::resident_image_dir()};
+  QwenLayerStream::set_resident_image_dir(cache.string());
+  QwenLayerStream::set_dense_weights_fp8(true);
+  int qsa = 0;
+  while (fx.cfg.layers.at(qsa) != dgpp::QwenLayerKind::Qsa) ++qsa;
+  uint64_t formats[2]{};
+  size_t sizes[2]{};
+  for (int pass = 0; pass < 4; ++pass) {
+    const bool full = pass % 2 != 0;
+    setenv("DGPP_QSA_INDEXER_BF16", full ? "1" : "0", 1);
+    formats[full] = dgpp::QwenLoaderFamily::loader_format();
+    QwenLayerStream stream(fx.cfg, fx.dir, 0, 1, dgpp::QwenResidency::Resident);
+    int loaded = 0;
+    for (const int layer : {qsa, fx.cfg.mtp_layer()}) {
+      if (layer < 0) continue;
+      const auto& r = stream.load_layer(layer);
+      const std::string name = dgpp::qwen_layer_prefix(fx.cfg, layer) +
+          "self_attn.indexer.index_qk_proj.weight";
+      require(r.qsa.q_proj == nullptr && r.qsa.q_proj_fp8.payload,
+              "other dense projections remain FP8");
+      if (full) {
+        require(r.qsa.index_qk_proj && !r.qsa.index_qk_proj_fp8.payload,
+                "index projection is checkpoint BF16 only");
+        expect_device_equals(r.qsa.index_qk_proj, fx.bytes(name), "checkpoint index weights");
+      } else {
+        require(!r.qsa.index_qk_proj && r.qsa.index_qk_proj_fp8.payload,
+                "baseline index projection remains FP8");
+      }
+      require(r.bytes == QwenLayerStream::layer_bytes(fx.cfg, layer, 0, 1),
+              "mixed-precision memory plan matches actual layer size");
+      if (layer == qsa) sizes[full] = r.bytes;
+      ++loaded;
+    }
+    require((pass < 2 ? stream.image_layers_captured() : stream.image_layers_restored()) == loaded,
+            "precision modes must capture separately then restore their own images");
+  }
+  require(formats[0] != formats[1], "indexer precision must separate resident images");
+  require(sizes[1] > sizes[0], "BF16 index weights add accounted memory");
   fs::remove_all(cache);
 }
 

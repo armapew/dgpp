@@ -227,7 +227,7 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     }
     a.q_norm = load_bf16(p + "q_norm.weight");
     a.k_norm = load_bf16(p + "k_norm.weight");
-    if (g_dense_weights_fp8)
+    if (g_dense_weights_fp8 && !QwenLayerStream::indexer_weights_bf16())
       a.index_qk_proj_fp8 = load_bf16_fp8(p + "indexer.index_qk_proj.weight");
     else
       a.index_qk_proj = load_bf16(p + "indexer.index_qk_proj.weight");
@@ -751,10 +751,18 @@ bool QwenLayerStream::ngram_table_mmap() { return g_ngram_table_mmap; }
 
 void QwenLayerStream::set_dense_weights_fp8(bool on) { g_dense_weights_fp8 = on; }
 bool QwenLayerStream::dense_weights_fp8() { return g_dense_weights_fp8; }
+bool QwenLayerStream::indexer_weights_bf16() {
+  const char* e = std::getenv("DGPP_QSA_INDEXER_BF16");
+  if (!e || !*e || std::string(e) == "0") return false;
+  if (std::string(e) == "1") return true;
+  throw std::invalid_argument("DGPP_QSA_INDEXER_BF16 must be 0 or 1");
+}
 // Bit 8: the NVFP4 experts' activation scales live in the layer image (a
 // resident image written without them is rebuilt, not misread).
 uint64_t QwenLoaderFamily::loader_format() {
-  return (g_dense_weights_fp8 ? 2 : 1) | (g_mtp_experts_bf16_fused ? 4 : 0) | 8;
+  // Bit 16 separates original-BF16 index projections from FP8 layer images.
+  return (g_dense_weights_fp8 ? 2 : 1) | (g_mtp_experts_bf16_fused ? 4 : 0) | 8 |
+      (g_dense_weights_fp8 && QwenLayerStream::indexer_weights_bf16() ? 16 : 0);
 }
 
 void QwenLayerStream::set_mtp_expert_format(bool on) { g_mtp_experts_bf16_fused = on; }
