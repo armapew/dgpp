@@ -66,7 +66,8 @@ class SiteEnvTest(unittest.TestCase):
     def test_qwen_runtime_options_survive_site_file_and_resolution(self):
         options = {"DGPP_QSA_QUERY_TILE": "2", "DGPP_QSA_DECODE_PARTS": "8",
                    "DGPP_DENSE_CACHE_MIB": "4096", "DGPP_BATCH_PREFILL": "1",
-                   "DGPP_SKIP_PREFILL_OUTPUT": "1"}
+                   "DGPP_SKIP_PREFILL_OUTPUT": "1",
+                   "DGPP_PREFIX_COALESCE": "1"}
         with self.env_file.open("a") as f:
             for key, value in options.items():
                 f.write(f"{key}={value}\n")
