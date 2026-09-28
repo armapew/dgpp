@@ -1,7 +1,7 @@
 # DGPP
 
 This is the Spark maintenance branch. See [FORK.md](FORK.md) for the accepted
-baseline, deployment profile and update workflow. `spark-2026.09.28.1` pins the
+baseline, deployment profile and update workflow. `spark-2026.09.28.2` pins the
 exact source of the deployed release.
 
 DGPP is a C++/CUDA inference engine for NVIDIA DGX Spark (GB10) systems.
