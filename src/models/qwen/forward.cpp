@@ -664,10 +664,6 @@ void QwenModel::prefetch_ple_value_side(const QwenLayerResident& r) {
 
 QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
   const int T = run.T, req = run.req;
-  const int mixed_rows = run.mixed_decode_rows;
-  if (mixed_rows && (mixed_rows != 1 || run.num_spans != 2 || run.span_lens[0] != 1 ||
-                     run.decode || run.capture || mtp_ || boundary_))
-    throw std::invalid_argument("Qwen mixed prototype: expected one plain world-1 decode row and one prefill span");
   if (run.all_rows && T > logits_capacity_rows_)
     throw std::invalid_argument("Qwen serving head: use full diagnostic storage for an all-row forward");
   walk_rows_ = T;
@@ -803,11 +799,6 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
           srows.pos = d_pos + row0;
           srows.request = run.span_reqs[sp];
           srows.pos0 = run.span_pos0[sp];
-          if (mixed_rows && sp == 0) {
-            srows.decode = true;
-            srows.spans = d_spans;
-            srows.num_requests = 1;
-          }
           qsa_->enqueue(x_ + static_cast<size_t>(row0) * H, len, srows, cache, attn_out + static_cast<size_t>(row0) * H, stream_);
           row0 += len;
         }
@@ -821,17 +812,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
     attn_gr_->combine(r_, attn_out, T, stream_);
     mlp_gr_->mix(r_, x_, T, stream_);
     uint16_t* ffn_out = stage(y_, H);
-    if (mixed_rows) {
-      // Preserve BF16 decode activations. Sending the leading row through
-      // the prefill W4A4 path would silently change its numerical contract.
-      qwen_configure_gemm_rows(gemm_, mixed_rows, true);
-      moe_->enqueue_decode(x_, ffn_out, mixed_rows, stream_);
-      qwen_configure_gemm_rows(gemm_, T - mixed_rows, false);
-      moe_->enqueue_prefill(x_ + static_cast<size_t>(mixed_rows) * H,
-                            ffn_out + static_cast<size_t>(mixed_rows) * H,
-                            T - mixed_rows, stream_);
-      qwen_configure_gemm_rows(gemm_, T, false);
-    } else if (run.decode) {
+    if (run.decode) {
       moe_->enqueue_decode(x_, ffn_out, T, stream_, run.capture ? layer : -1);
     } else if (moe_prefill_host_path_) {
       moe_->enqueue(x_, ffn_out, T, stream_);  // the host-orchestrated reference chain
@@ -1449,51 +1430,6 @@ std::vector<bool> QwenModel::session_prefill_advance_group(
   }
   std::vector<Base::PrefillCursor*> base(cursors.begin(), cursors.end());
   return Base::session_prefill_advance_group(base, chunk_tokens);
-}
-
-QwenModel::Outputs QwenModel::session_mixed_step_prefill(
-    int decode_req, int64_t token, PrefillCursor& c, int64_t budget) {
-  check_req(decode_req, "session_mixed_step_prefill");
-  check_req(c.req, "session_mixed_step_prefill");
-  if (mtp_ || c.images || decode_req == c.req || session_pos_[decode_req] <= 0 ||
-      c.next >= c.end || session_pos_[c.req] != c.next || token < 0 || token >= vocab_size_)
-    throw std::invalid_argument("session_mixed_step_prefill: unsupported session or token");
-  if (budget < snapshot_align_ || budget >= max_tokens_ || budget % snapshot_align_ != 0)
-    throw std::invalid_argument("session_mixed_step_prefill: invalid chunk budget");
-  int64_t end = c.cut_index < c.cuts.size() ? c.cuts[c.cut_index] : c.end;
-  end = std::min(end, (c.next / budget + 1) * budget);
-  session_reserve_blocks(decode_req, session_pos_[decode_req] + 1);
-  if (c.suspended) { push_position(c.req); c.suspended = false; }
-  std::vector<int64_t> ids{token};
-  ids.insert(ids.end(), c.ids + c.next - c.start, c.ids + end - c.start);
-  const int32_t reqs[2]{decode_req, c.req}, lengths[2]{1, static_cast<int32_t>(end - c.next)};
-  const int64_t positions[2]{session_pos_[decode_req], c.next};
-  RowRun run;
-  run.req = decode_req; run.ids = ids.data(); run.T = static_cast<int>(ids.size());
-  run.span_reqs = reqs; run.span_pos0 = positions; run.span_lens = lengths; run.num_spans = 2;
-  run.mixed_decode_rows = 1;
-  const auto all = run_rows(run);
-  Outputs decode;
-  const auto assign = [&](Outputs& out, int row) {
-    out.lm_vocab_begin = all.lm_vocab_begin; out.lm_vocab_count = all.lm_vocab_count;
-    out.logits.assign(all.logits.begin() + row * lm_vocab_count_, all.logits.begin() + (row + 1) * lm_vocab_count_);
-    out.final_hidden_bits.assign(all.final_hidden_bits.begin() + row * hidden_,
-                                 all.final_hidden_bits.begin() + (row + 1) * hidden_);
-  };
-  assign(decode, 0); assign(c.output, 1);
-  ++session_pos_[decode_req]; push_position(decode_req);
-  session_pos_[c.req] = end; push_position(c.req);
-  for (auto* snap = c.snap; snap; snap = snap->next) if (!snap->taken && snap->position == end) {
-    *snap->meta = session_snapshot(c.req, snap->dst); snap->taken = true;
-  }
-  if (c.cut_index < c.cuts.size() && end == c.cuts[c.cut_index]) ++c.cut_index;
-  c.next = end;
-  if (end < c.end) {
-    DGPP_CUDA_OK(cudaMemsetAsync(d_session_pos_ + c.req, 0xff, sizeof(int64_t), stream_));
-    c.suspended = true;
-  }
-  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
-  return decode;
 }
 
 QwenModel::Outputs QwenModel::session_prefill_with_images(
