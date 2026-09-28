@@ -531,12 +531,14 @@ DGPP_TEST(qwen_layer_yields_preserve_prefill_and_interleaved_decode_state) {
 
 DGPP_TEST(qwen_layer_yields_preserve_graph_mtp_and_cached_slot_state) {
   const char* old = std::getenv("DGPP_PREFILL_LAYER_YIELD");
-  struct Restore { bool had; std::string value; ~Restore() {
+  struct Restore { bool had; std::string value; bool mapped; ~Restore() {
     if (had) setenv("DGPP_PREFILL_LAYER_YIELD", value.c_str(), 1); else unsetenv("DGPP_PREFILL_LAYER_YIELD");
-  }} restore{old != nullptr, old ? old : ""};
+    dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
+  }} restore{old != nullptr, old ? old : "", dgpp::QwenLayerStream::ngram_table_mmap()};
   const auto cfg = qwenfx::tiny_nvfp4_config();
   const std::string dir = "qwen_layer_yield_graph_fixture";
   qwenfx::write_fixture(cfg, dir, qwenfx::tiny_text_json(), qwenfx::tiny_nvfp4_quant_json());
+  dgpp::QwenLayerStream::set_ngram_table_mmap(true);
   for (int depth : {1, 2, 5}) {
     std::vector<std::vector<int32_t>> reference;
     for (int arm : {0, 1}) {
