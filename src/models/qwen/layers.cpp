@@ -66,6 +66,12 @@ void gemm_dense(const QwenGemmWorkspace& g, const uint16_t* act, int64_t act_str
     // BF16 interface on the dequantized matrix when the bridge holds it.
     const size_t bf16_bytes = static_cast<size_t>(n) * static_cast<size_t>(k) * 2;
     if (m > 128 && g.dequant && bf16_bytes <= g.dequant_bytes) {
+      if (g.dense_cache) {
+        if (const auto* retained = g.dense_cache->get(w8, stream)) {
+          gemm_bf16(g, act, act_stride, retained, out, out_type, m, n, k, stream);
+          return;
+        }
+      }
       launch_fp8_dequant_blocks(w8.payload, w8.scales, g.dequant, n, k, stream);
       gemm_bf16(g, act, act_stride, g.dequant, out, out_type, m, n, k, stream);
       return;
@@ -87,6 +93,42 @@ void gemm_dense(const QwenGemmWorkspace& g, const uint16_t* act, int64_t act_str
 }
 
 }  // namespace
+
+size_t QwenDenseCache::configured_bytes() {
+  const char* value = std::getenv("DGPP_DENSE_CACHE_MIB");
+  if (!value || !*value) return 0;
+  char* end = nullptr;
+  const long mib = std::strtol(value, &end, 10);
+  if (*end || mib < 0 || mib > 8192)
+    throw std::invalid_argument("DGPP_DENSE_CACHE_MIB must be an integer in [0, 8192]");
+  return static_cast<size_t>(mib) << 20;
+}
+
+QwenDenseCache::QwenDenseCache(size_t bytes) : bytes_(bytes) {
+  if (bytes) DGPP_CUDA_OK(cudaMalloc(&arena_, bytes));
+}
+
+QwenDenseCache::~QwenDenseCache() { cudaFree(arena_); }
+
+const uint16_t* QwenDenseCache::get(const GlmQuantMatrix& w, cudaStream_t stream) {
+  for (const auto& entry : entries_)
+    if (entry.source.payload == w.payload && entry.source.scales == w.scales &&
+        entry.source.rows == w.rows && entry.source.cols == w.cols)
+      return entry.values;
+  const size_t bytes = static_cast<size_t>(w.rows) * w.cols * sizeof(uint16_t);
+  const size_t aligned = (bytes + 255) & ~size_t{255};
+  if (!w.payload || aligned > bytes_ - used_) return nullptr;
+  // Graph captures must not become responsible for initializing a retained
+  // matrix. Existing entries may be read; a miss keeps the original bridge.
+  cudaStreamCaptureStatus status;
+  DGPP_CUDA_OK(cudaStreamIsCapturing(stream, &status));
+  if (status != cudaStreamCaptureStatusNone) return nullptr;
+  uint16_t* values = arena_ + used_ / sizeof(uint16_t);
+  launch_fp8_dequant_blocks(w.payload, w.scales, values, w.rows, w.cols, stream);
+  entries_.push_back({w, values});
+  used_ += aligned;
+  return values;
+}
 
 void qwen_configure_gemm_rows(CublasLtGemm& gemm, int tokens, bool decode) {
   const bool wide_decode = decode && tokens > 16;

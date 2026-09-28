@@ -110,6 +110,12 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
     dense_bridge_bytes_ = dense_bridge_bytes(cfg_, loader_.geometry());
     gw_.dequant = dev_alloc<uint16_t>(dense_bridge_bytes_ / 2);
     gw_.dequant_bytes = dense_bridge_bytes_;
+    const size_t cache_bytes = QwenDenseCache::configured_bytes();
+    if (residency == QwenResidency::Resident && cache_bytes > 0) {
+      dense_cache_ = std::make_unique<QwenDenseCache>(cache_bytes);
+      gw_.dense_cache = dense_cache_.get();
+      DGPP_LOG_INFO("Qwen: exact dense BF16 cache reserves {} MiB", cache_bytes >> 20);
+    }
   }
   // The dense sites' lowering (kernels/gemm.hpp dense_gemv_rows): the GEMV
   // chunks (and the fused multi-problem launches) to the bound, cuBLASLt's
@@ -261,6 +267,8 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
     if (packed > 0) plan.add("bf16 decode packing (12-bit companions)", packed);
   }
   plan.add("gemm workspace (at least)", size_t{64} << 20);
+  if (QwenLayerStream::dense_weights_fp8() && residency == QwenResidency::Resident)
+    plan.add("exact dense BF16 cache", QwenDenseCache::configured_bytes());
   if (QwenLayerStream::dense_weights_fp8())
     plan.add("dense fp8 prefill bridge (the largest dense matrix in BF16)",
              dense_bridge_bytes(cfg, QwenLocalGeometry::from_config(cfg, tp_rank, tp_world, head)));

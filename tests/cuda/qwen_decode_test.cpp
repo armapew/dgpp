@@ -151,6 +151,56 @@ int audit(QwenModel& ref, const std::vector<int64_t>& prompt, const Transcript& 
 
 // The prefill head must match the diagnostic full head across the GEMV/dense
 // transition. A one-row GEMV substitution fails this gate for long prompts.
+int run_dense_cache(const std::string& dir) {
+  const auto cfg = QwenTextConfig::from_json_file((fs::path(dir) / "config.json").string());
+  const char* previous = std::getenv("DGPP_DENSE_CACHE_MIB");
+  const bool had_previous = previous != nullptr;
+  const std::string previous_value = previous ? previous : "";
+  const bool old_fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
+  struct Restore {
+    bool present, fp8;
+    std::string value;
+    ~Restore() {
+      if (present) setenv("DGPP_DENSE_CACHE_MIB", value.c_str(), 1);
+      else unsetenv("DGPP_DENSE_CACHE_MIB");
+      dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
+    }
+  } restore{had_previous, old_fp8, previous_value};
+  dgpp::QwenLayerStream::set_dense_weights_fp8(true);
+  setenv("DGPP_DENSE_CACHE_MIB", "0", 1);
+  QwenModel reference(cfg, dir, 1024, 4096, QwenResidency::Resident, nullptr, 0, 1, 4, true, 24, true, true);
+  const auto plain_plan = QwenModel::plan_memory(cfg, 1024, 4096, 0, 1, QwenResidency::Resident, 4, true, 24, true);
+  for (const int mib : {1, 64}) {
+    setenv("DGPP_DENSE_CACHE_MIB", std::to_string(mib).c_str(), 1);
+    QwenModel cached(cfg, dir, 1024, 4096, QwenResidency::Resident, nullptr, 0, 1, 4, true, 24, true, true);
+    const auto plan = QwenModel::plan_memory(cfg, 1024, 4096, 0, 1, QwenResidency::Resident, 4, true, 24, true);
+    require(plan.total_bytes() - plain_plan.total_bytes() == (size_t{1} << 20) * mib,
+            "dense cache memory plan must include the full arena");
+    for (const int length : {129, 257, 1024, 257}) {
+      const auto prompt = smoke_tokens(cfg, length, 0xD315000 + length);
+      const auto ref = reference.session_prefill(0, prompt);
+      const auto got = cached.session_prefill(0, prompt);
+      require(bitwise(ref.logits, got.logits) && ref.final_hidden_bits == got.final_hidden_bits,
+              "dense cache changes prefill values");
+      int64_t token = argmax(ref.logits.data(), reference.lm_vocab_count());
+      for (int step = 0; step < 6; ++step) {
+        require(bitwise(reference.session_draft(0, {token}).logits, cached.session_draft(0, {token}).logits),
+                "dense cache changes MTP state");
+        const auto a = reference.session_step(0, token), b = cached.session_step(0, token);
+        require(bitwise(a.logits, b.logits), "dense cache changes decode values");
+        token = argmax(a.logits.data(), reference.lm_vocab_count());
+      }
+      reference.session_close(0);
+      cached.session_close(0);
+    }
+    require(cached.dense_cache_used_bytes() > 0 && cached.dense_cache_used_bytes() <= (size_t{1} << 20) * mib,
+            "dense cache must be exercised within its bound");
+    std::printf("[ OK ] %d MiB dense cache: %zu retained bytes, bitwise prefill/draft/decode\n", mib,
+                cached.dense_cache_used_bytes());
+  }
+  return 0;
+}
+
 int run_prefill_head(const std::string& dir) {
   const QwenTextConfig cfg = QwenTextConfig::from_json_file((fs::path(dir) / "config.json").string());
   const bool old_fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
@@ -969,7 +1019,7 @@ int run_checkpoint(const std::string& dir, const std::vector<int64_t>& ids, int 
 
 int main(int argc, char** argv) {
   std::string fixture, checkpoint, ids_text;
-  bool fp8_head = false, prefill_head = false;
+  bool fp8_head = false, prefill_head = false, dense_cache = false;
   int steps = 4;
   int layers_extra = -1;
   for (int i = 1; i < argc; ++i) {
@@ -979,13 +1029,16 @@ int main(int argc, char** argv) {
       fp8_head = true;
     else if (a == "--prefill-head")
       prefill_head = true;
+    else if (a == "--dense-cache")
+      dense_cache = true;
     else if (a == "--checkpoint-dir" && i + 1 < argc) checkpoint = argv[++i];
     else if (a == "--ids" && i + 1 < argc) ids_text = argv[++i];
     else if (a == "--steps" && i + 1 < argc) steps = std::stoi(argv[++i]);
     else if (a == "--layers" && i + 1 < argc) layers_extra = std::stoi(argv[++i]);
   }
   try {
-    if (!fixture.empty()) return prefill_head ? run_prefill_head(fixture) : run_fixture(fixture, fp8_head);
+    if (!fixture.empty()) return dense_cache ? run_dense_cache(fixture) :
+        (prefill_head ? run_prefill_head(fixture) : run_fixture(fixture, fp8_head));
     if (!checkpoint.empty()) {
       std::vector<int64_t> ids;
       std::stringstream ss(ids_text);

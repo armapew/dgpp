@@ -117,6 +117,7 @@ class QwenModel : public SessionModel<QwenModel> {
             BoundaryReducer* boundary = nullptr, int tp_rank = 0, int tp_world = 1,
             int max_requests = 1, bool mtp = false, int decode_rows = 0, bool fp8_head_mma = false, bool serving_logits = false);
   bool fp8_head_mma() const { return fp8_head_mma_; }
+  size_t dense_cache_used_bytes() const { return dense_cache_ ? dense_cache_->used_bytes() : 0; }
   ~QwenModel();
   QwenModel(const QwenModel&) = delete;
   QwenModel& operator=(const QwenModel&) = delete;
@@ -270,6 +271,7 @@ class QwenModel : public SessionModel<QwenModel> {
   void* gemm_ws_ = nullptr;
   size_t gemm_ws_bytes_ = 0;
   QwenGemmWorkspace gw_;
+  std::unique_ptr<QwenDenseCache> dense_cache_;
   QwenGlobalsResident globals_;
   QwenNgramTableResident table_;
   bool has_ple_ = false;

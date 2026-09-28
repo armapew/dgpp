@@ -26,6 +26,27 @@
 
 namespace dgpp {
 
+// Resident weights only: retain the same rounded BF16 values that the
+// ordinary FP8 bridge produces. A fixed arena bounds the additional memory;
+// matrices that do not fit continue through the ordinary scratch bridge.
+class QwenDenseCache {
+ public:
+  explicit QwenDenseCache(size_t bytes);
+  ~QwenDenseCache();
+  QwenDenseCache(const QwenDenseCache&) = delete;
+  QwenDenseCache& operator=(const QwenDenseCache&) = delete;
+  const uint16_t* get(const GlmQuantMatrix& weight, cudaStream_t stream);
+  static size_t configured_bytes();
+  size_t used_bytes() const { return used_; }
+  size_t entries() const { return entries_.size(); }
+
+ private:
+  struct Entry { GlmQuantMatrix source; const uint16_t* values; };
+  uint16_t* arena_ = nullptr;
+  size_t bytes_ = 0, used_ = 0;
+  std::vector<Entry> entries_;
+};
+
 // The GEMM interface's workspace, shared by every layer object of a model.
 struct QwenGemmWorkspace {
   IGemm* gemm = nullptr;
@@ -44,6 +65,7 @@ struct QwenGemmWorkspace {
   // mma_from_rows take the streaming tensor-core GEMM (0: never).
   int gemv_rows = 8;
   int mma_from_rows = 0;
+  QwenDenseCache* dense_cache = nullptr;
 };
 
 // Select decode lowering by token rows, before a projection flattens the
