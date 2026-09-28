@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <exception>
 #include <fstream>
 #include <numeric>
 #include <stdexcept>
