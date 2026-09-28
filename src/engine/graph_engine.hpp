@@ -1466,6 +1466,20 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     reserved_[static_cast<size_t>(req)] = true;
   }
 
+  void set_prefill_yield_hook(std::function<bool(bool)> hook) override {
+    if constexpr (requires { model_->set_prefill_yield_hook(hook); }) {
+      if (!hook || world_ != 1) { model_->set_prefill_yield_hook({}); return; }
+      model_->set_prefill_yield_hook([this, hook = std::move(hook)](bool execute) {
+        if (!execute) return hook(false);
+        drain();
+        reseed_live_feeds();
+        const bool progress = hook(true);
+        drain();
+        return progress;
+      });
+    }
+  }
+
   std::vector<int32_t> step(int req) override {
     std::vector<std::vector<int32_t>> out = step_batch({req});
     return std::move(out[0]);

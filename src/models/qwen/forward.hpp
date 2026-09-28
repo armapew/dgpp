@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 // Qwen3.8-Flash-Next model with resident or streaming weights. The shared
 // SessionModel core manages request state and execution around run_rows(),
 // which follows transformers' Qwen4ExpTextDecoderLayer:
@@ -118,6 +119,7 @@ class QwenModel : public SessionModel<QwenModel> {
             int64_t max_cache_tokens, QwenResidency residency = QwenResidency::Streaming,
             BoundaryReducer* boundary = nullptr, int tp_rank = 0, int tp_world = 1,
             int max_requests = 1, bool mtp = false, int decode_rows = 0, bool fp8_head_mma = false, bool serving_logits = false);
+  void set_prefill_yield_hook(std::function<bool(bool)> hook) { prefill_yield_hook_ = std::move(hook); }
   bool fp8_head_mma() const { return fp8_head_mma_; }
   bool skip_intermediate_prefill_output() const { return skip_prefill_output_; }
   size_t dense_cache_used_bytes() const { return dense_cache_ ? dense_cache_->used_bytes() : 0; }
@@ -227,6 +229,9 @@ class QwenModel : public SessionModel<QwenModel> {
   void restore_chain_state(int req);
 
  private:
+  int prefill_yield_layers_ = 0;
+  uint16_t* prefill_saved_r_ = nullptr;
+  std::function<bool(bool)> prefill_yield_hook_;
   const bool fp8_head_mma_;
   int draft_vocab_limit_ = 0;
   int ngram_lookahead_tokens_ = 0;

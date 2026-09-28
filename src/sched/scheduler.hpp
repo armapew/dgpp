@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 // Deterministic admission, decoding and cancellation over a session engine.
 // Every rank applies the same policy to journaled requests and cancellations.
 // Decisions must not depend on clocks, thread arrival order or unordered
@@ -53,6 +54,7 @@ struct LogitBias {
 class SchedulerEngine {
  public:
   virtual ~SchedulerEngine() = default;
+  virtual void set_prefill_yield_hook(std::function<bool(bool)> hook) { (void)hook; }
 
   const std::shared_ptr<PrefillMonitor>& prefill_monitor() const { return prefill_monitor_; }
 
@@ -510,6 +512,7 @@ class Scheduler {
   Scheduler(SchedulerEngine* engine, std::vector<int64_t> eos_token_ids,
             int queue_limit = 0, AdmissionPolicy policy = AdmissionPolicy{},
             int prefix_slots = -1);
+  ~Scheduler() { engine_->set_prefill_yield_hook({}); }
   const AdmissionPolicy& admission_policy() const { return policy_; }
   // The prefix cache as configured: its slot count (0 = off) and the
   // running digest of every decision it made (the journal's cross-rank
@@ -784,6 +787,7 @@ class Scheduler {
   int64_t decode_steps_ = 0;
   int64_t decode_rows_ = 0;
   double prefill_ms_ = 0.0;
+  double prefill_yield_ms_ = 0.0;
   double prefill_request_ms_ = 0.0;
   double step_ms_ = 0.0;
   PrefixCache cache_;              // the prefix cache's index (M7)

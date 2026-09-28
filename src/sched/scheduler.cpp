@@ -119,6 +119,26 @@ Scheduler::Scheduler(SchedulerEngine* engine,
     throw std::invalid_argument(
         "Scheduler: engine decode batch capacity must be in [1, " +
         std::to_string(slots_.size()) + "]");
+  engine_->set_prefill_yield_hook([this](bool execute) {
+    if (policy_.mode != AdmissionPolicy::Mode::kFullReserve) return false;
+    std::vector<int> active;
+    for (size_t i = 0; i < requests_.size(); ++i) {
+      if (requests_[i].state != State::kActive) continue;
+      // Physical graph replays include every live slot. A pending stop
+      // waits for the ordinary retire sweep; never replay a partial set.
+      if (requests_[i].cancel_requested || requests_[i].stop_requested) return false;
+      active.push_back(static_cast<int>(i));
+    }
+    if (active.size() > static_cast<size_t>(decode_batch_capacity_)) return false;
+    if (active.empty()) return false;
+    if (execute) {
+      const auto start = std::chrono::steady_clock::now();
+      rolling_snapshots();
+      step_batch(active);
+      prefill_yield_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+    return true;
+  });
 }
 
 bool Scheduler::is_eos(int32_t token) const {
@@ -629,6 +649,7 @@ void Scheduler::admit_group(const std::vector<int>& arrivals) {
     slots.push_back(admit_prepare(arrival));
     prompts.push_back(&requests_[static_cast<size_t>(arrival)].spec.prompt);
   }
+  const double yielded_before = prefill_yield_ms_;
   const auto t_prefill = std::chrono::steady_clock::now();
   std::vector<int32_t> tokens;
   try {
@@ -642,7 +663,7 @@ void Scheduler::admit_group(const std::vector<int>& arrivals) {
   }
   const double prefill_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - t_prefill)
-                                .count();
+                                .count() - (prefill_yield_ms_ - yielded_before);
   if (tokens.size() != arrivals.size())
     throw std::runtime_error("Scheduler: the engine's group prefill returned " + std::to_string(tokens.size()) +
                              " tokens for " + std::to_string(arrivals.size()) + " requests");
@@ -664,6 +685,7 @@ void Scheduler::admit(int arrival) {
   const int slot = admit_prepare(arrival);
   int32_t token = -1;
   int64_t attached = 0;  // prompt tokens an attach skipped (meters)
+  const double yielded_before = prefill_yield_ms_;
   const auto t_prefill = std::chrono::steady_clock::now();
   if (!cache_on(r)) {
     // No cache for this request: the pre-cache op, exactly.
@@ -749,7 +771,7 @@ void Scheduler::admit(int arrival) {
   }
   const double prefill_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - t_prefill)
-                                .count();
+                                .count() - (prefill_yield_ms_ - yielded_before);
   prefill_ms_ += prefill_ms;
   admit_finish(arrival, slot, token, prefill_ms, attached);
 }
@@ -839,10 +861,11 @@ void Scheduler::begin_prefill(int arrival, int64_t budget) {
 
 void Scheduler::advance_prefill(int arrival, int64_t budget) {
   Request& r = requests_[static_cast<size_t>(arrival)];
+  const double yielded_before = prefill_yield_ms_;
   const auto started = std::chrono::steady_clock::now();
   const auto progress = engine_->advance_prefill(r.slot, budget);
   const double ms = std::chrono::duration<double, std::milli>(
-      std::chrono::steady_clock::now() - started).count();
+      std::chrono::steady_clock::now() - started).count() - (prefill_yield_ms_ - yielded_before);
   prefill_ms_ += ms;
   apply_prefill_progress(arrival, budget, progress, ms);
 }
@@ -854,10 +877,11 @@ void Scheduler::advance_prefills(const std::vector<int>& arrivals, int64_t budge
   }
   std::vector<int> slots;
   for (int arrival : arrivals) slots.push_back(requests_[static_cast<size_t>(arrival)].slot);
+  const double yielded_before = prefill_yield_ms_;
   const auto started = std::chrono::steady_clock::now();
   const auto progress = engine_->advance_prefill_group(slots, budget);
   const double ms = std::chrono::duration<double, std::milli>(
-      std::chrono::steady_clock::now() - started).count();
+      std::chrono::steady_clock::now() - started).count() - (prefill_yield_ms_ - yielded_before);
   prefill_ms_ += ms;
   if (progress.size() != arrivals.size()) throw std::runtime_error("Scheduler: incomplete prefill group");
   for (size_t i = 0; i < arrivals.size(); ++i) apply_prefill_progress(arrivals[i], budget, progress[i], ms);

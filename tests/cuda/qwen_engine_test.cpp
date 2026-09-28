@@ -490,6 +490,113 @@ DGPP_TEST(qwen_draft_shortlist_preserves_grouped_cache_and_mtp_transcripts) {
   check_grouped_continuations(true);
 }
 
+DGPP_TEST(qwen_layer_yields_preserve_prefill_and_interleaved_decode_state) {
+  const char* old = std::getenv("DGPP_PREFILL_LAYER_YIELD");
+  const bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();
+  struct Restore { bool had; std::string value; bool mapped; ~Restore() {
+    if (had) setenv("DGPP_PREFILL_LAYER_YIELD", value.c_str(), 1); else unsetenv("DGPP_PREFILL_LAYER_YIELD");
+    dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
+  }} restore{old != nullptr, old ? old : "", mapped};
+  const auto cfg = qwenfx::tiny_nvfp4_config();
+  const std::string dir = "qwen_layer_yield_fixture";
+  qwenfx::write_fixture(cfg, dir, qwenfx::tiny_text_json(), qwenfx::tiny_nvfp4_quant_json());
+  dgpp::QwenLayerStream::set_ngram_table_mmap(true);
+  std::vector<float> expected_prefill, expected_parent, expected_followup;
+  for (int arm : {0, 1}) {
+    setenv("DGPP_PREFILL_LAYER_YIELD", arm ? "3" : "0", 1);
+    QwenModel model(cfg, dir, 128, 2048, QwenResidency::Resident, nullptr, 0, 1, 2);
+    model.set_decode_route_traces(false);
+    (void)model.session_prefill(1, smoke_tokens(cfg, 32, 371));
+    int yielded = 0;
+    std::vector<float> parent;
+    if (arm) model.set_prefill_yield_hook([&](bool execute) {
+      if (execute) parent = model.session_step(1, 13 + yielded++).logits;
+      return true;
+    });
+    const auto out = model.session_prefill(0, smoke_tokens(cfg, 101, 971), std::vector<int64_t>{64});
+    // The 64-token snapshot grid splits this prompt into two chunks, each
+    // yielding after its PLE-containing third layer.
+    if (arm) require(yielded == 2, "both prefill chunks yielded at a complete layer boundary");
+    else for (int i = 0; i < 2; ++i) parent = model.session_step(1, 13 + i).logits;
+    const auto followup = model.session_step(0, 97).logits;
+    if (!arm) { expected_prefill = out.logits; expected_parent = parent; expected_followup = followup; }
+    else {
+      require(out.logits == expected_prefill, "yield changed prefill logits");
+      require(parent == expected_parent, "yield changed the decoding peer's state");
+      require(followup == expected_followup, "yield changed the prefilled request's future state");
+    }
+    model.session_close(0); model.session_close(1);
+  }
+}
+
+DGPP_TEST(qwen_layer_yields_preserve_graph_mtp_and_cached_slot_state) {
+  const char* old = std::getenv("DGPP_PREFILL_LAYER_YIELD");
+  struct Restore { bool had; std::string value; ~Restore() {
+    if (had) setenv("DGPP_PREFILL_LAYER_YIELD", value.c_str(), 1); else unsetenv("DGPP_PREFILL_LAYER_YIELD");
+  }} restore{old != nullptr, old ? old : ""};
+  const auto cfg = qwenfx::tiny_nvfp4_config();
+  const std::string dir = "qwen_layer_yield_graph_fixture";
+  qwenfx::write_fixture(cfg, dir, qwenfx::tiny_text_json(), qwenfx::tiny_nvfp4_quant_json());
+  for (int depth : {1, 2, 5}) {
+    std::vector<std::vector<int32_t>> reference;
+    for (int arm : {0, 1}) {
+      setenv("DGPP_PREFILL_LAYER_YIELD", arm ? "3" : "0", 1);
+      auto buses = start_world(1, kPort + 31);
+      QwenModel model(cfg, dir, 128, 2048, QwenResidency::Resident, nullptr, 0, 1, 4,
+                      true, 4 * (depth + 1), true, true);
+      uint16_t* scratch = nullptr;
+      DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch), 2 * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
+      std::vector<std::vector<int32_t>> observed;
+      {
+        GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
+            cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 0, nullptr, 4, depth, false);
+        for (int round = 0; round < 2; ++round) {
+          std::vector<std::vector<int32_t>> rows(4);
+          for (int req : {1,3}) {
+            rows[req].push_back(graph.prefill(req, smoke_tokens(cfg, 32, 372 + req)));
+            graph.reserve(req, 256);
+          }
+          const auto advance = [&] {
+            const auto tokens = graph.step_batch({1,3});
+            for (size_t i = 0; i < tokens.size(); ++i)
+              rows[i ? 3 : 1].insert(rows[i ? 3 : 1].end(), tokens[i].begin(), tokens[i].end());
+          };
+          int yields = 0;
+          if (arm) graph.set_prefill_yield_hook([&](bool execute) {
+            if (yields == (round ? 1 : 2)) return false;
+            if (execute) { advance(); ++yields; }
+            return true;
+          });
+          const std::vector<int64_t> cuts{64};
+          dgpp::sched::SchedulerEngine::PrefixPrefill plan; plan.boundaries = &cuts;
+          if (!round) { plan.snap_slot = 0; plan.snap_position = 64; }
+          else { plan.attach_slot = 0; plan.attach_position = 64; }
+          if (!arm) for (int i = 0; i < (round ? 1 : 2); ++i) advance();
+          rows[0].push_back(graph.prefill_cached(0, smoke_tokens(cfg, 101, 971), &plan));
+          graph.reserve(0, 256);
+          graph.set_prefill_yield_hook({});
+          if (arm) require(yields == (round ? 1 : 2), "graph prefill did not yield expected chunks");
+          for (int step = 0; step < 24; ++step) {
+            const auto tokens = graph.step_batch({0,1,3});
+            for (size_t i = 0; i < tokens.size(); ++i) {
+              const int req = i < 2 ? static_cast<int>(i) : 3;
+              rows[req].insert(rows[req].end(), tokens[i].begin(), tokens[i].end());
+            }
+          }
+          for (int req : {0,1,3}) {
+            graph.close(req); rows[req].resize(24); observed.push_back(std::move(rows[req]));
+          }
+        }
+        graph.drain(); graph.prefix_release(0);
+        require(graph.pool_blocks_in_use() == 0, "yielded cache blocks leaked");
+      }
+      DGPP_CUDA_OK(cudaFreeHost(scratch));
+      if (!arm) reference = observed;
+      else require(observed == reference, "layer-yield changed graph/cache/MTP transcripts");
+    }
+  }
+}
+
 DGPP_TEST(qwen_pending_body_retarget_matches_a_preplanned_snapshot_with_mtp) {
   struct RestorePrecision {
     bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();

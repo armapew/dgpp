@@ -50,6 +50,15 @@ bool compact_serving_logits(bool serving) {
   return serving && QwenLayerStream::dense_weights_fp8() && !(all && all[0] == '1');
 }
 
+int prefill_yield_layers() {
+  const char* value = std::getenv("DGPP_PREFILL_LAYER_YIELD");
+  if (!value) return 0;
+  char* end = nullptr; const long n = std::strtol(value, &end, 10);
+  if (end == value || *end || n < 0 || n > 48)
+    throw std::invalid_argument("DGPP_PREFILL_LAYER_YIELD expects 0..48");
+  return static_cast<int>(n);
+}
+
 }  // namespace
 
 QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_dir, int max_tokens,
@@ -201,6 +210,12 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
 
   const size_t M = static_cast<size_t>(max_tokens_);
   r_ = dev_alloc<uint16_t>(M * W);
+  prefill_yield_layers_ = prefill_yield_layers();
+  if (prefill_yield_layers_) {
+    if (tp_world != 1 || residency != QwenResidency::Resident)
+      throw std::invalid_argument("layer-level prefill yielding needs one resident GPU");
+    prefill_saved_r_ = dev_alloc<uint16_t>(M * W);
+  }
   x_ = dev_alloc<uint16_t>(M * H);
   y_ = dev_alloc<uint16_t>(M * H);
   {
@@ -332,6 +347,7 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
   plan.add("activations (hyper state, rows, head)",
            token_rows * 8 + M * 12 + 8 + M * W * 2 + 3 * M * H * 2 + logits_rows * V * 4 + rows * 64,
            rows * V * 4 + rows * H * 2 + token_rows * 8 + rows * 32 + R * 40);
+  if (prefill_yield_layers()) plan.add("paused prefill hyper state", M * W * 2);
   // The layer objects (built once, rebound per layer).
   // Scoring is per request. A shared pool larger than the positional limit
   // does not make more compressed keys visible to any one row.
@@ -368,6 +384,7 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
 }
 
 QwenModel::~QwenModel() {
+  cudaFree(prefill_saved_r_);
   cudaFree(gdn_rec_);
   cudaFree(gdn_conv_);
   cudaFree(ple_conv_state_);
@@ -862,6 +879,32 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
     if (run.decode) prefetch_attention_side(layer + 1);
     fold(ffn_out, H);  // block boundary 2: the experts' sliced down projections
     mlp_gr_->combine(r_, ffn_out, T, stream_);
+    if (!run.decode && prefill_yield_layers_ && prefill_yield_hook_ &&
+        layer + 1 < cfg_.num_hidden_layers && (layer + 1) % prefill_yield_layers_ == 0 &&
+        (!has_ple_ || layer >= cfg_.ple_layer()) && prefill_yield_hook_(false)) {
+      // A layer boundary needs only the hyper state. Other sites recompute
+      // their scratch in the next layer; request KV/recurrent state is owned
+      // per slot. The PLE gather must already have been consumed.
+      d2d(prefill_saved_r_, r_, static_cast<size_t>(T) * W * 2, stream_);
+      std::vector<int> paused;
+      if (run.num_spans > 0) paused.assign(run.span_reqs, run.span_reqs + run.num_spans);
+      else paused.push_back(req);
+      for (int q : paused) {
+        DGPP_CUDA_OK(cudaMemsetAsync(d_session_pos_ + q, 0xff, sizeof(int64_t), stream_));
+        if (mtp_) DGPP_CUDA_OK(cudaMemsetAsync(d_mtp_pos_ + q, 0xff, sizeof(int64_t), stream_));
+      }
+      DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+      const auto restore = [&] {
+        for (int q : paused) { push_position(q); if (mtp_) push_mtp_position(q); }
+        d2d(r_, prefill_saved_r_, static_cast<size_t>(T) * W * 2, stream_);
+        (void)begin_run(run);
+        walk_rows_ = T;
+        qwen_configure_gemm_rows(gemm_, T, false);
+      };
+      try { prefill_yield_hook_(true); }
+      catch (...) { restore(); throw; }
+      restore();
+    }
     if (run.capture_layers) {
       DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
       std::vector<uint16_t> snap(static_cast<size_t>(T) * W);
