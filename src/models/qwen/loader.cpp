@@ -776,7 +776,8 @@ bool QwenLayerStream::target_kv_weights_bf16() {
 // Bit 8: the NVFP4 experts' activation scales live in the layer image (a
 // resident image written without them is rebuilt, not misread).
 uint64_t QwenLoaderFamily::loader_format() {
-  // Bit 16 separates original-BF16 index projections from FP8 layer images.
+  // Bit 16 separates original-BF16 index projections; bit 64 separates
+  // original-BF16 target K/V. MTP K/V remain in the configured dense format.
   return (g_dense_weights_fp8 ? 2 : 1) | (g_mtp_experts_bf16_fused ? 4 : 0) | 8 |
       (g_dense_weights_fp8 && QwenLayerStream::indexer_weights_bf16() ? 16 : 0) |
       (g_dense_weights_fp8 && QwenLayerStream::target_kv_weights_bf16() ? 64 : 0);
