@@ -188,9 +188,14 @@ class QwenNgramTableMmap {
   int64_t capacity() const { return capacity_; }
   int head_dim() const { return head_dim_; }
   size_t mapped_bytes() const { return mapped_bytes_; }
+  void configure_lookahead(const QwenNgramGeometry& geometry, int eos) const;
+  void prefetch_tokens(int req, std::vector<int32_t> tokens, int prev1, int prev2) const;
+  void cancel_prefetch(int req) const;
 
  private:
   struct GatherPool;
+  struct Lookahead;
+  mutable std::unique_ptr<Lookahead> lookahead_;
   std::unique_ptr<GatherPool> gather_pool_;
   bool staged_gather_ = false;
   size_t page_bytes_ = 4096;

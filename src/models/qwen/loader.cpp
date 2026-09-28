@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <thread>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <unordered_map>
@@ -23,6 +24,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
+#include "models/qwen/ple_reference.hpp"
 
 namespace dgpp {
 namespace {
@@ -827,6 +829,88 @@ struct QwenNgramTableMmap::GatherPool {
   }
 };
 
+// Hints only: production gathers remain the authoritative data path. Jobs
+// own token copies, so cancellation/slot reuse never leaves a borrowed prompt.
+struct QwenNgramTableMmap::Lookahead {
+  struct Job { int req, prev1, prev2; std::vector<int32_t> tokens; };
+  const QwenNgramTableMmap& table;
+  QwenNgramGeometry geometry;
+  int eos;
+  std::mutex mutex;
+  std::condition_variable ready;
+  std::deque<Job> jobs;
+  bool stopping = false;
+  std::thread worker;
+  Lookahead(const QwenNgramTableMmap& t, const QwenNgramGeometry& g, int e)
+      : table(t), geometry(g), eos(e), worker([this] { work(); }) {}
+  ~Lookahead() {
+    { std::lock_guard lock(mutex); stopping = true; jobs.clear(); }
+    ready.notify_one(); worker.join();
+  }
+  void work() {
+    for (;;) {
+      Job job;
+      {
+        std::unique_lock lock(mutex);
+        ready.wait(lock, [&] { return stopping || !jobs.empty(); });
+        if (stopping) return;
+        job = std::move(jobs.front()); jobs.pop_front();
+      }
+      try {
+        const int n = static_cast<int>(job.tokens.size());
+        std::vector<int32_t> ids(static_cast<size_t>(n) * geometry.heads);
+        qwen_ref::ple_hash_ids(job.tokens.data(), n, job.prev1, job.prev2, eos,
+            geometry.multipliers.data(), geometry.head_vocab.data(), geometry.head_offset.data(),
+            geometry.heads, geometry.heads / 2, ids.data());
+        std::vector<uintptr_t> pages;
+        pages.reserve(ids.size() * 2);
+        const uintptr_t mask = ~(static_cast<uintptr_t>(table.page_bytes_) - 1);
+        for (int32_t id : ids) {
+          const uintptr_t p = reinterpret_cast<uintptr_t>(table.row(id));
+          const uintptr_t first = p & mask, last = (p + table.head_dim_ - 1) & mask;
+          for (uintptr_t page = first;; page += table.page_bytes_) {
+            pages.push_back(page); if (page == last) break;
+          }
+        }
+        std::sort(pages.begin(), pages.end());
+        pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+        for (size_t i = 0; i < pages.size();) {
+          const uintptr_t begin = pages[i++]; uintptr_t end = begin + table.page_bytes_;
+          while (i < pages.size() && pages[i] == end && end - begin < 65536) {
+            ++i; end += table.page_bytes_;
+          }
+          madvise(reinterpret_cast<void*>(begin), end - begin, MADV_WILLNEED);
+        }
+      } catch (const std::exception& e) {
+        DGPP_LOG_WARN("Qwen n-gram lookahead hint skipped: {}", e.what());
+      }
+    }
+  }
+};
+
+void QwenNgramTableMmap::configure_lookahead(const QwenNgramGeometry& g, int eos) const {
+  if (!lookahead_) lookahead_ = std::make_unique<Lookahead>(*this, g, eos);
+}
+
+void QwenNgramTableMmap::prefetch_tokens(int req, std::vector<int32_t> tokens, int prev1, int prev2) const {
+  if (!lookahead_ || tokens.empty()) return;
+  if (req < 0 || req >= 16 || tokens.size() > 65536)
+    throw std::invalid_argument("n-gram lookahead exceeds its bounded queue");
+  auto& p = *lookahead_;
+  {
+    std::lock_guard lock(p.mutex);
+    std::erase_if(p.jobs, [&](const auto& j) { return j.req == req; });
+    p.jobs.push_back({req, prev1, prev2, std::move(tokens)});
+  }
+  p.ready.notify_one();
+}
+
+void QwenNgramTableMmap::cancel_prefetch(int req) const {
+  if (!lookahead_) return;
+  std::lock_guard lock(lookahead_->mutex);
+  std::erase_if(lookahead_->jobs, [&](const auto& j) { return j.req == req; });
+}
+
 QwenNgramTableMmap::QwenNgramTableMmap(std::vector<Part> parts, int64_t capacity, int head_dim)
     : parts_(std::move(parts)), capacity_(capacity), head_dim_(head_dim) {
   if (capacity_ <= 0 || head_dim_ <= 0 || parts_.empty())
@@ -869,6 +953,7 @@ QwenNgramTableMmap::QwenNgramTableMmap(std::vector<Part> parts, int64_t capacity
 }
 
 QwenNgramTableMmap::~QwenNgramTableMmap() {
+  lookahead_.reset();
   gather_pool_.reset();
   for (Mapping& m : maps_) {
     if (m.base) munmap(m.base, m.len);

@@ -139,6 +139,16 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
   gw_.mma_from_rows = dense_gemv_rows() + 1;
   has_ple_ = !cfg_.ple_layer_ids.empty();
   if (has_ple_) table_ = loader_.load_ngram_table();
+  if (const char* value = std::getenv("DGPP_NGRAM_LOOKAHEAD_TOKENS")) {
+    char* end = nullptr; const long count = std::strtol(value, &end, 10);
+    if (end == value || *end || count < 0 || count > 65536)
+      throw std::invalid_argument("DGPP_NGRAM_LOOKAHEAD_TOKENS: expected 0..65536");
+    if (table_.mmap && count) {
+      ngram_lookahead_tokens_ = static_cast<int>(count);
+      table_.mmap->configure_lookahead(cfg_.ngram_geometry(), eos_);
+      DGPP_LOG_INFO("Qwen: bounded n-gram lookahead {} tokens", count);
+    }
+  }
   for (int l = 0; l < cfg_.num_hidden_layers; ++l)
     (cfg_.layers[static_cast<size_t>(l)] == QwenLayerKind::Gdn ? num_gdn_ : num_qsa_) += 1;
   n_moe_layers_ = cfg_.num_hidden_layers;  // every layer carries the MoE
@@ -525,6 +535,7 @@ void QwenModel::build_layer_objects(const QwenLayerResident& r) {
 // core's open_slot / close): zero GDN recurrent/conv states, zero PLE conv
 // state, EOS n-gram context, zero rings, no blocks.
 void QwenModel::reset_slot_state(int req) {
+  if (table_.mmap) table_.mmap->cancel_prefetch(req);
   if (num_gdn_ > 0) {
     DGPP_CUDA_OK(cudaMemsetAsync(gdn_rec(req, 0), 0, static_cast<size_t>(num_gdn_) * gdn_rec_elems_ * 4, stream_));
     DGPP_CUDA_OK(cudaMemsetAsync(gdn_conv(req, 0), 0, static_cast<size_t>(num_gdn_) * gdn_conv_elems_ * 2, stream_));
@@ -1428,10 +1439,23 @@ QwenModel::PrefillCursor QwenModel::session_prefill_begin(
   ImagePrefillScope scope(*this, req, images);
   auto cursor = Base::session_prefill_begin(req, prompt, reserve_tokens, chunk_tokens, boundaries,
                                             snap, attach_position);
-  return PrefillCursor{std::move(cursor), has_images ? images : nullptr};
+  return PrefillCursor{std::move(cursor), has_images ? images : nullptr, prompt.data(), attach_position};
+}
+
+void QwenModel::prefetch_ngram(PrefillCursor& cursor) {
+  if (!ngram_lookahead_tokens_ || !cursor.full_prompt || cursor.end <= cursor.next) return;
+  const int64_t first = std::max(cursor.next, cursor.prefetched_until);
+  const int64_t end = std::min(cursor.end, cursor.next + ngram_lookahead_tokens_);
+  if (end <= first) return;
+  std::vector<int32_t> tokens(cursor.full_prompt + first, cursor.full_prompt + end);
+  const int p1 = first > 0 ? static_cast<int>(cursor.full_prompt[first - 1]) : eos_;
+  const int p2 = first > 1 ? static_cast<int>(cursor.full_prompt[first - 2]) : eos_;
+  table_.mmap->prefetch_tokens(cursor.req, std::move(tokens), p1, p2);
+  cursor.prefetched_until = end;
 }
 
 bool QwenModel::session_prefill_advance(PrefillCursor& cursor, int64_t chunk_tokens) {
+  prefetch_ngram(cursor);
   ImagePrefillScope scope(*this, cursor.req, cursor.images);
   const bool done = Base::session_prefill_advance(cursor, chunk_tokens);
   if (done) cursor.images = nullptr;
@@ -1445,6 +1469,7 @@ std::vector<bool> QwenModel::session_prefill_advance_group(
     for (auto* c : cursors) done.push_back(session_prefill_advance(*c, chunk_tokens));
     return done;
   }
+  for (auto* cursor : cursors) if (cursor) prefetch_ngram(*cursor);
   std::vector<Base::PrefillCursor*> base(cursors.begin(), cursors.end());
   return Base::session_prefill_advance_group(base, chunk_tokens);
 }

@@ -80,6 +80,8 @@ class QwenModel : public SessionModel<QwenModel> {
   using SnapshotRequest = Base::SnapshotRequest;
   struct PrefillCursor : Base::PrefillCursor {
     const std::vector<ImageInput>* images = nullptr;
+    const int64_t* full_prompt = nullptr;
+    int64_t prefetched_until = 0;
   };
   // Several cold prompts as the spans of one walk (session_prefill_group,
   // 2026-09-14, the group prefill ported from DeepSeek): the GDN scan and
@@ -227,6 +229,8 @@ class QwenModel : public SessionModel<QwenModel> {
  private:
   const bool fp8_head_mma_;
   int draft_vocab_limit_ = 0;
+  int ngram_lookahead_tokens_ = 0;
+  void prefetch_ngram(PrefillCursor& cursor);
   const bool compact_logits_;
   static constexpr int kBlockTokens = 64;
   static constexpr int kPrefillChunkTokens = 4096;
