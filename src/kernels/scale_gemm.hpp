@@ -78,7 +78,7 @@ void launch_scale_gemm_f32(const uint16_t* act, size_t act_row_stride_elems,
                            int mma_from_rows = 0, bool last_row_only = false, void* ws = nullptr,
                            size_t ws_bytes = 0, int compact_row = -1);
 
-// Experimental draft-only shortlist: score the leading `limit` vocabulary
+// Optional draft-only shortlist: score the leading `limit` vocabulary
 // rows and the last 128 rows, leaving other draft logits at -infinity. The
 // target still scores the entire vocabulary. No extra weight allocation.
 void launch_draft_head_prefix_fp8_f32(const uint16_t* act, const uint8_t* weights,

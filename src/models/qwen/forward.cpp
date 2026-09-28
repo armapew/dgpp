@@ -85,7 +85,7 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
       if (tp_world != 1 || !globals_.lm_head_fp8.payload || cfg_.vocab_size % 128)
         throw std::invalid_argument("draft shortlist requires one GPU and an aligned FP8 head");
       draft_vocab_limit_ = static_cast<int>(limit);
-      DGPP_LOG_INFO("Qwen: experimental draft vocabulary prefix {}, target vocabulary unchanged", limit);
+      DGPP_LOG_INFO("Qwen: draft vocabulary prefix {}, target vocabulary unchanged", limit);
     }
   }
   // The generic session core (engine/session_model.hpp) over this family's
