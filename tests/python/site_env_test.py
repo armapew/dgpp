@@ -67,7 +67,7 @@ class SiteEnvTest(unittest.TestCase):
         options = {"DGPP_QSA_QUERY_TILE": "2", "DGPP_QSA_DECODE_PARTS": "8",
                    "DGPP_DENSE_CACHE_MIB": "4096", "DGPP_BATCH_PREFILL": "1",
                    "DGPP_SKIP_PREFILL_OUTPUT": "1",
-                   "DGPP_PREFIX_COALESCE": "1"}
+                   "DGPP_PREFIX_COALESCE": "1", "DGPP_QSA_INDEXER_BF16": "1"}
         with self.env_file.open("a") as f:
             for key, value in options.items():
                 f.write(f"{key}={value}\n")
