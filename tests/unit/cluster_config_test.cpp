@@ -230,7 +230,7 @@ DGPP_TEST(cluster_config_accepts_qwen_runtime_options) {
         "DGPP_QSA_QUERY_TILE":"2","DGPP_QSA_DECODE_PARTS":"8",
         "DGPP_DENSE_CACHE_MIB":"4096","DGPP_BATCH_PREFILL":"1",
         "DGPP_SKIP_PREFILL_OUTPUT":"1",
-        "DGPP_PREFIX_COALESCE":"1","DGPP_QSA_INDEXER_BF16":"1"}]})", "t");
+        "DGPP_PREFIX_COALESCE":"1","DGPP_QSA_INDEXER_BF16":"1","DGPP_NGRAM_STAGING":"1"}]})", "t");
   const auto& env = c.node_env.at(0);
   require(env.at("DGPP_QSA_QUERY_TILE") == "2" &&
               env.at("DGPP_QSA_DECODE_PARTS") == "8" &&
@@ -238,7 +238,7 @@ DGPP_TEST(cluster_config_accepts_qwen_runtime_options) {
               env.at("DGPP_BATCH_PREFILL") == "1" &&
               env.at("DGPP_SKIP_PREFILL_OUTPUT") == "1" &&
               env.at("DGPP_PREFIX_COALESCE") == "1" &&
-              env.at("DGPP_QSA_INDEXER_BF16") == "1",
+              env.at("DGPP_QSA_INDEXER_BF16") == "1" && env.at("DGPP_NGRAM_STAGING") == "1",
           "Qwen runtime choices survive resolved configuration parsing");
 }
 
