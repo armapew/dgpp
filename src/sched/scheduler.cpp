@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <format>
 #include <stdexcept>
 #include <string>
@@ -78,6 +79,11 @@ Scheduler::Scheduler(SchedulerEngine* engine,
   pc.align = std::max<int64_t>(1, prefix_info_.align);
   pc.chunk_tokens = std::max<int64_t>(1, prefix_info_.chunk_tokens);
   cache_ = PrefixCache(pc);
+  if (const char* e = std::getenv("DGPP_PREFIX_COALESCE")) {
+    if (std::string(e) != "0" && std::string(e) != "1")
+      throw std::invalid_argument("DGPP_PREFIX_COALESCE must be 0 or 1");
+    coalesce_prefills_ = std::string(e) == "1";
+  }
   if (policy_.window_tokens < 1)
     throw std::invalid_argument(
         "Scheduler: the admission window must be at least one token");
@@ -221,6 +227,46 @@ Scheduler::PrefixPlan Scheduler::plan_prefix(const Request& r) const {
   return plan;
 }
 
+bool Scheduler::awaiting_shared_prefix(size_t arrival) {
+  Request& r = requests_[arrival];
+  if (!coalesce_prefills_ || policy_.prefill_budget_tokens <= 0 ||
+      !cache_on(r) || !r.spec.images.empty() || r.coalesce_wait_ticks >= 128)
+    return false;
+  const int64_t attached = plan_prefix(r).attach_position;
+  // Only wait for an older, already executing prefill with an allocated
+  // snapshot. The dependency graph cannot cycle, and cancellation or a
+  // failed/finished leader removes the dependency on the next tick.
+  for (size_t i = 0; i < arrival; ++i) {
+    const Request& leader = requests_[i];
+    if (leader.state != State::kPrefilling || !cache_on(leader) ||
+        !leader.spec.images.empty() || leader.cancel_requested || leader.stop_requested)
+      continue;
+    const int64_t cuts[] = {
+        leader.prefill_snap_slot >= 0 ? leader.prefill_snap_position : 0,
+        leader.prefill_body_slot >= 0 ? leader.prefill_body_position : 0};
+    for (const int64_t cut : cuts) {
+      if (cut - attached < 8192 ||
+          !std::binary_search(r.cuts.begin(), r.cuts.end(), cut)) continue;
+      // MTP prefill snapshots may include the token immediately after the
+      // cut; exact token comparison covers it as the normal cache lookup does.
+      const int64_t count = cut + (prefix_info_.prefill_lookahead ? 1 : 0);
+      if (count > static_cast<int64_t>(r.spec.prompt.size()) ||
+          count > static_cast<int64_t>(leader.spec.prompt.size()) ||
+          !std::equal(r.spec.prompt.begin(), r.spec.prompt.begin() + count,
+                      leader.spec.prompt.begin())) continue;
+      if (r.coalesce_wait_ticks == 0)
+        DGPP_LOG_INFO("sched: request '{}' waits for '{}' to publish a {}-token prefix",
+                      r.spec.id, leader.spec.id, cut);
+      if (r.coalesce_last_tick != ticks_) {
+        r.coalesce_last_tick = ticks_;
+        ++r.coalesce_wait_ticks;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
 int64_t Scheduler::snapshot_blocks(int64_t position) const {
   const int64_t bt = prefix_info_.block_tokens;
   return bt > 0 && position > 0 && position % bt != 0 ? 1 : 0;
@@ -266,6 +312,7 @@ int Scheduler::next_admissible() {
       engine_->pool_blocks_total() - engine_->pool_blocks_in_use();
   for (size_t i = 0; i < requests_.size(); ++i) {
     if (requests_[i].state != State::kQueued) continue;
+    if (awaiting_shared_prefix(i)) continue;
     // No head-of-line blocking: the OLDEST request that FITS admits. A
     // large deferred request must not dam the queue behind it — the
     // starvation it could suffer under an unbounded small-request stream
@@ -1263,6 +1310,7 @@ bool Scheduler::quantum() {
         const int64_t free_blocks = engine_->pool_blocks_total() - engine_->pool_blocks_in_use();
         for (size_t i = 0; i < requests_.size(); ++i) {
           if (requests_[i].state != State::kQueued) continue;
+          if (awaiting_shared_prefix(i)) continue;
           if (new_blocks(requests_[i], plan_prefix(requests_[i])) <= free_blocks) {
             next = static_cast<int>(i);
             break;
@@ -1314,6 +1362,7 @@ bool Scheduler::quantum() {
           engine_->pool_blocks_total() - engine_->pool_blocks_in_use();
       for (size_t i = 0; i < requests_.size(); ++i) {
         if (requests_[i].state != State::kQueued) continue;
+        if (awaiting_shared_prefix(i)) continue;
         if (!needs_chunked_prefill(static_cast<int>(i), budget)) continue;
         if (new_blocks(requests_[i], plan_prefix(requests_[i])) <= free_blocks) {
           begin_arrival = static_cast<int>(i);

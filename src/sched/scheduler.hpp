@@ -589,6 +589,8 @@ class Scheduler {
     int64_t rolling_position = -1;
     int64_t hop_armed = -1;    // the aligned position armed for the next step
     bool cache_off = false;    // the pool cannot hold the cache's blocks for it
+    uint64_t coalesce_last_tick = 0;
+    int coalesce_wait_ticks = 0;
     PrefixCache::Images cache_images;
     // The retire line's numbers: the admission clock, the
     // prefill's wall and the prompt tokens an attach skipped, and the
@@ -619,6 +621,7 @@ class Scheduler {
            (r.spec.images.empty() || engine_->supports_image_prefix_cache());
   }
   PrefixPlan plan_prefix(const Request& r) const;
+  bool awaiting_shared_prefix(size_t arrival);
   void finish_prefill_snapshot(Request& r, int slot, int64_t position, bool taken);
   // The pool block a snapshot's private partial-block copy takes: one when
   // the position is not block-aligned, none otherwise (or without a pool).
@@ -751,6 +754,7 @@ class Scheduler {
   PrefixCache cache_;              // the prefix cache's index (M7)
   SchedulerEngine::PrefixInfo prefix_info_;
   uint64_t ticks_ = 0;             // the LRU clock
+  bool coalesce_prefills_ = false;
 };
 
 // Streaming lifecycle events for the service (SSE). Fired inline on the

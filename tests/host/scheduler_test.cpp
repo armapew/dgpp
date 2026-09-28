@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <stdexcept>
 #include <sstream>
@@ -496,6 +497,111 @@ DGPP_TEST(scheduler_serving_auto_prefill_budget_respects_engine_geometry_and_opt
   policy.prefill_budget_tokens = -1;
   engine.align = engine.limit = 0;
   require(resolved().prefill_budget_tokens == 0, "unsupported engine keeps synchronous prefill");
+}
+
+namespace {
+struct CoalesceEnv {
+  bool had = std::getenv("DGPP_PREFIX_COALESCE") != nullptr;
+  std::string old = had ? std::getenv("DGPP_PREFIX_COALESCE") : "";
+  explicit CoalesceEnv(bool on = true) { setenv("DGPP_PREFIX_COALESCE", on ? "1" : "0", 1); }
+  ~CoalesceEnv() {
+    if (had) setenv("DGPP_PREFIX_COALESCE", old.c_str(), 1);
+    else unsetenv("DGPP_PREFIX_COALESCE");
+  }
+};
+class CoalesceEngine : public ChunkFakeEngine {
+ public:
+  CoalesceEngine() : ChunkFakeEngine(200000) {
+    slots_ = batch_capacity_ = 4;
+    set_prefix_arena(24, 4, 2048);
+    for (int req = 0; req < 4; ++req)
+      for (int episode = 0; episode < 8; ++episode) arm(req, {10 + req, 20 + req}, 2);
+  }
+  int64_t prefill_chunk_limit() const override { return 4096; }
+  bool supports_grouped_prefill_advance() const override { return true; }
+};
+SchedulerRequest coalescing_request(std::string id, int branch) {
+  auto r = make_request(id, 13001, 1);
+  r.prompt[12500] = branch + 20;
+  return r;
+}
+}
+
+DGPP_TEST(scheduler_coalesces_only_matching_cold_prefixes_and_bounds_work) {
+  for (bool enabled : {false, true}) {
+    CoalesceEnv env(enabled);
+    CoalesceEngine engine;
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefill_budget_tokens = 4096;
+    Scheduler sched(&engine, {}, 0, policy);
+    for (int i = 0; i < 4; ++i) sched.submit(coalescing_request("r" + std::to_string(i), i));
+    sched.tick();
+    require(sched.meters().prefilling == (enabled ? 1 : 4), "only the shared leader starts when enabled");
+    require(sched.meters().queued == (enabled ? 3 : 0), "followers remain queued without reservations");
+    while (sched.has_pending()) {
+      const auto before = sched.meters().prompt_tokens_computed;
+      sched.tick();
+      require(sched.meters().prompt_tokens_computed - before <= 4096, "coalescing preserves the token budget");
+    }
+    require(sched.meters().prompt_tokens_computed == (enabled ? 13001 + 3 * 713 : 4 * 13001),
+            "followers compute only the suffix after the complete shared prefix");
+    for (const auto& result : sched.results()) require(result.steps_done == 1, "all requests finish");
+    require(sched.meters().pool_blocks_in_use == sched.meters().prefix_blocks_pinned,
+            "only reusable cache blocks remain after completion");
+  }
+}
+
+DGPP_TEST(scheduler_prefix_coalescing_releases_cancelled_dependencies_and_bypasses_unrelated_work) {
+  for (int cancel : {0, 1}) {
+    CoalesceEnv env;
+    CoalesceEngine engine;
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefill_budget_tokens = 4096;
+    Scheduler sched(&engine, {}, 0, policy);
+    sched.submit(coalescing_request("leader", 0));
+    sched.submit(coalescing_request("follower", 1));
+    auto unrelated = coalescing_request("unrelated", 2); unrelated.prompt[0] = 432;
+    sched.submit(unrelated);
+    sched.tick();
+    require(sched.meters().prefilling == 2 && sched.meters().queued == 1,
+            "a waiting follower must not block an unrelated request");
+    require(sched.cancel(cancel == 0 ? "leader" : "follower"), "cancel the chosen dependency member");
+    sched.run_to_completion();
+    require(sched.find(cancel == 0 ? "leader" : "follower")->status == Scheduler::Result::Status::kCancelled,
+            "cancellation is honored");
+    require(sched.find(cancel == 0 ? "follower" : "leader")->steps_done == 1 &&
+            sched.find("unrelated")->steps_done == 1, "surviving requests finish");
+    require(sched.meters().pool_blocks_in_use == sched.meters().prefix_blocks_pinned,
+            "cancelled dependencies leave no active reservations");
+  }
+}
+
+DGPP_TEST(scheduler_prefix_coalescing_checks_mtp_lookahead_and_has_a_wait_limit) {
+  CoalesceEnv env;
+  {
+    CoalesceEngine engine; engine.prefill_lookahead_ = true;
+    dgpp::sched::AdmissionPolicy policy; policy.prefill_budget_tokens = 4096;
+    Scheduler sched(&engine, {}, 0, policy);
+    sched.submit(coalescing_request("leader", 0));
+    auto next = coalescing_request("different-lookahead", 1); next.prompt[10240] = 100;
+    sched.submit(next); sched.tick();
+    require(sched.meters().prefilling == 2 && sched.meters().queued == 0,
+            "MTP's next token is part of snapshot compatibility");
+    sched.run_to_completion();
+  }
+  {
+    CoalesceEngine engine;
+    dgpp::sched::AdmissionPolicy policy; policy.prefill_budget_tokens = 4;
+    Scheduler sched(&engine, {}, 0, policy);
+    sched.submit(coalescing_request("slow", 0));
+    sched.submit(coalescing_request("bounded-wait", 1));
+    for (int i = 0; i < 129; ++i) sched.tick();
+    require(sched.meters().prefilling == 2 && sched.meters().queued == 0,
+            "a follower eventually computes independently rather than waiting indefinitely");
+    sched.cancel("slow"); sched.cancel("bounded-wait"); sched.tick();
+    require(!sched.has_pending() && sched.meters().pool_blocks_in_use == 0,
+            "fallback and cancellation release all unfinished snapshots");
+  }
 }
 
 DGPP_TEST(scheduler_grouped_chunk_admission_bounds_work_and_cancels_independently) {
