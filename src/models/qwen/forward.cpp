@@ -104,6 +104,8 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
   gemm_ws_bytes_ = std::max<size_t>(64u << 20, gemm_.query_workspace_bytes(max_tokens_, lm_vocab_count_, H, DType::BF16));
   gemm_ws_ = dev_alloc<char>(gemm_ws_bytes_);
   gw_ = QwenGemmWorkspace{&gemm_, gemm_ws_, gemm_ws_bytes_};
+  const char* skip_output = std::getenv("DGPP_SKIP_PREFILL_OUTPUT");
+  skip_prefill_output_ = skip_output && skip_output[0] == '1';
   if (QwenLayerStream::dense_weights_fp8()) {
     // The FP8 dense stack's prefill bridge: the largest dense matrix of
     // this rank's slice, in BF16.
@@ -871,7 +873,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
   // chunks, BF16 heads (cuBLAS is m-dependent), decode, all-row runs and
   // group prefills keep the full head. DGPP_PREFILL_HEAD_ALL_ROWS=1 keeps
   // it everywhere.
-  mixer_->mix(r_, h_, T, stream_);
+  if (run.read_output) mixer_->mix(r_, h_, T, stream_);
   static const bool head_all_rows = [] {
     const char* e = std::getenv("DGPP_PREFILL_HEAD_ALL_ROWS");
     return e != nullptr && e[0] == '1';
@@ -880,7 +882,10 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
   const bool last_row_only = !run.decode && !run.all_rows && run.num_spans == 0 && T > 1 &&
                              globals_.lm_head_fp8.payload != nullptr && !mma_envelope && !head_all_rows;
   const bool packed_logits = compact_logits_ && T > logits_capacity_rows_;
-  if (packed_logits) {
+  if (!run.read_output) {
+    // Intermediate chunks need target state and MTP inputs, but their
+    // logits/hidden readout would be overwritten by the next chunk.
+  } else if (packed_logits) {
     // T exceeds the decode envelope, so each selected row keeps the same
     // GEMV/dense-MMA dispatch as the original full prefill head. Grouped
     // prefill packs one selected row per span; hidden rows stay in place.

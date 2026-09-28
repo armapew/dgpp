@@ -140,6 +140,7 @@ class SessionModel : public PrefillReporting {
     const int32_t* span_lens = nullptr;
     int num_spans = 0;
     int mixed_decode_rows = 0;  // diagnostic Qwen mixed-walk prototype only
+    bool read_output = true;
   };
   // The staged inputs of a walk (begin_run).
   struct RowInputs {
@@ -713,6 +714,12 @@ template <class D>
 typename SessionModel<D>::Outputs SessionModel<D>::finish_run(const RowRun& run, Outputs&& out, bool packed_logits) {
   const int T = run.T;
   const size_t H = static_cast<size_t>(hidden_);
+  if (!run.read_output) {
+    if (!run.capture) DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+    out.lm_vocab_begin = lm_vocab_begin_;
+    out.lm_vocab_count = lm_vocab_count_;
+    return std::move(out);
+  }
   // The decode tail's rows into the pinned mirrors: eager rows always
   // (they sync right below); a capture records the copies only while the
   // mirrors are on (the kernels-only decode graph turns them off).
@@ -824,6 +831,8 @@ void SessionModel<D>::prefill_chunk(PrefillCursor& cursor, int64_t budget) {
   for (auto* at = snap; at != nullptr; at = at->next)
     run.last_chunk |= !at->taken && at->position == c1;
   cursor.span_start = run.last_chunk;
+  if constexpr (requires { derived().skip_intermediate_prefill_output(); })
+    run.read_output = c1 == end || !derived().skip_intermediate_prefill_output();
   Outputs chunk = derived().run_rows(run);
   out.logits = std::move(chunk.logits);
   out.final_hidden_bits = std::move(chunk.final_hidden_bits);
@@ -990,6 +999,12 @@ std::vector<bool> SessionModel<D>::session_prefill_advance_group(
   run.span_pos0 = positions.data();
   run.span_lens = lengths.data();
   run.num_spans = static_cast<int>(cursors.size());
+  if constexpr (requires { derived().skip_intermediate_prefill_output(); }) {
+    if (derived().skip_intermediate_prefill_output()) {
+      run.read_output = false;
+      for (size_t i = 0; i < cursors.size(); ++i) run.read_output |= ends[i] == cursors[i]->end;
+    }
+  }
   Outputs all = derived().run_rows(run);
   std::vector<bool> done(cursors.size());
   size_t offset = 0;
@@ -1000,9 +1015,11 @@ std::vector<bool> SessionModel<D>::session_prefill_advance_group(
     const int64_t c0 = positions[s], c1 = ends[s];
     out.lm_vocab_begin = all.lm_vocab_begin;
     out.lm_vocab_count = all.lm_vocab_count;
-    out.logits.assign(all.logits.begin() + s * lm_vocab_count_, all.logits.begin() + (s + 1) * lm_vocab_count_);
-    out.final_hidden_bits.assign(all.final_hidden_bits.begin() + s * hidden_,
-                                 all.final_hidden_bits.begin() + (s + 1) * hidden_);
+    if (run.read_output) {
+      out.logits.assign(all.logits.begin() + s * lm_vocab_count_, all.logits.begin() + (s + 1) * lm_vocab_count_);
+      out.final_hidden_bits.assign(all.final_hidden_bits.begin() + s * hidden_,
+                                   all.final_hidden_bits.begin() + (s + 1) * hidden_);
+    }
     const auto append_rows = [&](const auto& src, auto& dst) {
       if (dst.size() < src.size()) dst.resize(src.size());
       for (size_t l = 0; l < src.size(); ++l) {

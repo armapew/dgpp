@@ -153,6 +153,63 @@ int audit(QwenModel& ref, const std::vector<int64_t>& prompt, const Transcript& 
 
 // The prefill head must match the diagnostic full head across the GEMV/dense
 // transition. A one-row GEMV substitution fails this gate for long prompts.
+int run_skip_output(const std::string& dir) {
+  const auto cfg = QwenTextConfig::from_json_file((fs::path(dir) / "config.json").string());
+  const char* previous = std::getenv("DGPP_SKIP_PREFILL_OUTPUT");
+  const std::string saved = previous ? previous : "";
+  struct Restore {
+    bool had, fp8; std::string saved;
+    ~Restore() {
+      if (had) setenv("DGPP_SKIP_PREFILL_OUTPUT", saved.c_str(), 1);
+      else unsetenv("DGPP_SKIP_PREFILL_OUTPUT");
+      dgpp::QwenLayerStream::set_dense_weights_fp8(fp8);
+    }
+  } restore{previous != nullptr, dgpp::QwenLayerStream::dense_weights_fp8(), saved};
+  dgpp::QwenLayerStream::set_dense_weights_fp8(true);
+  const auto prompt = smoke_tokens(cfg, 389, 0x31876);
+  for (bool mtp : {false, true}) {
+    setenv("DGPP_SKIP_PREFILL_OUTPUT", "0", 1);
+    QwenModel reference(cfg, dir, 128, 2048, QwenResidency::Resident, nullptr, 0, 1, 2, mtp, 16, true, true);
+    setenv("DGPP_SKIP_PREFILL_OUTPUT", "1", 1);
+    QwenModel optimized(cfg, dir, 128, 2048, QwenResidency::Resident, nullptr, 0, 1, 2, mtp, 16, true, true);
+    require(!reference.skip_intermediate_prefill_output() && optimized.skip_intermediate_prefill_output(),
+            "output-skip comparison must exercise both paths");
+    uint8_t* buffers[2]{};
+    QwenModel::SessionSnapshotMeta metas[2];
+    QwenModel::SnapshotRequest snaps[2];
+    for (int i = 0; i < 2; ++i) {
+      DGPP_CUDA_OK(cudaMalloc(&buffers[i], reference.session_snapshot_bytes()));
+      snaps[i].dst = buffers[i]; snaps[i].meta = &metas[i]; snaps[i].position = 192;
+    }
+    auto a = reference.session_prefill(0, prompt, {64, 192, 256}, &snaps[0]);
+    auto b = optimized.session_prefill(0, prompt, {64, 192, 256}, &snaps[1]);
+    for (int round = 0; round < 2; ++round) {
+      require(bitwise(a.logits, b.logits) && a.final_hidden_bits == b.final_hidden_bits,
+              "skipping unused readout changes final prefill values");
+      int64_t token = argmax(a.logits.data(), reference.lm_vocab_count());
+      for (int step = 0; step < 8; ++step) {
+        if (mtp) require(bitwise(reference.session_draft(0, {token}).logits,
+                                optimized.session_draft(0, {token}).logits), "skipped readout changes draft");
+        a = reference.session_step(0, token); b = optimized.session_step(0, token);
+        require(bitwise(a.logits, b.logits), "skipped readout changes decode");
+        token = argmax(a.logits.data(), reference.lm_vocab_count());
+      }
+      reference.session_close(0); optimized.session_close(0);
+      if (round == 0) {
+        reference.session_attach(0, buffers[0], metas[0]); optimized.session_attach(0, buffers[1], metas[1]);
+        const std::vector<int64_t> suffix(prompt.begin() + 192, prompt.end());
+        a = reference.session_prefill_resume(0, suffix, {256});
+        b = optimized.session_prefill_resume(0, suffix, {256});
+      }
+    }
+    reference.session_release_snapshot(metas[0]); optimized.session_release_snapshot(metas[1]);
+    for (auto* buffer : buffers) DGPP_CUDA_OK(cudaFree(buffer));
+    require(reference.kv_blocks_in_use() == 0 && optimized.kv_blocks_in_use() == 0, "readout-skip cache lifecycle");
+  }
+  std::printf("[ OK ] skipped intermediate readout: bitwise cold/cached prefill, draft and decode\n");
+  return 0;
+}
+
 int run_mixed_bench(const std::string& dir, int context, const std::string& ids_file) {
   const auto cfg = QwenTextConfig::from_json_file((fs::path(dir) / "config.json").string());
   dgpp::QwenLayerStream::set_dense_weights_fp8(true);
@@ -1189,6 +1246,7 @@ int main(int argc, char** argv) {
   bool fp8_head = false, prefill_head = false, dense_cache = false, grouped_mtp = false;
   bool grouped_chunks = false;
   bool mixed_bench = false;
+  bool skip_output = false;
   int mixed_context = 1024;
   std::string mixed_ids;
   int steps = 4;
@@ -1207,6 +1265,7 @@ int main(int argc, char** argv) {
     else if (a == "--grouped-chunks")
       grouped_chunks = true;
     else if (a == "--mixed-bench") mixed_bench = true;
+    else if (a == "--skip-prefill-output") skip_output = true;
     else if (a == "--mixed-context" && i + 1 < argc) mixed_context = std::stoi(argv[++i]);
     else if (a == "--mixed-ids" && i + 1 < argc) mixed_ids = argv[++i];
     else if (a == "--checkpoint-dir" && i + 1 < argc) checkpoint = argv[++i];
@@ -1215,6 +1274,7 @@ int main(int argc, char** argv) {
     else if (a == "--layers" && i + 1 < argc) layers_extra = std::stoi(argv[++i]);
   }
   try {
+    if (!fixture.empty() && skip_output) return run_skip_output(fixture);
     if (mixed_bench) return run_mixed_bench(fixture.empty() ? checkpoint : fixture, mixed_context, mixed_ids);
     if (!fixture.empty() && grouped_chunks) return run_grouped_chunks(fixture);
     if (!fixture.empty() && grouped_mtp) return run_grouped_mtp(fixture);
