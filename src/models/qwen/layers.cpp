@@ -616,7 +616,8 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
   const int64_t* d_pos = rows.pos;
 
   // Projections.
-  if (w_.q_proj_fp8.payload && T <= std::min(8, g_.gemv_rows)) {
+  if (w_.q_proj_fp8.payload && w_.k_proj_fp8.payload && w_.v_proj_fp8.payload &&
+      T <= std::min(8, g_.gemv_rows)) {
     // The FP8 form at decode rows: the four projections as one
     // multi-problem fp8 GEMV.
     Fp8GemvProblem p[4];
