@@ -150,6 +150,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         static const char* const kNodeKeys[] = {
             "DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR",
             "DGPP_LOG_LEVEL", "DGPP_MLOCK",
+            "DGPP_QSA_QUERY_TILE", "DGPP_QSA_DECODE_PARTS", "DGPP_DENSE_CACHE_MIB",
+            "DGPP_BATCH_PREFILL", "DGPP_SKIP_PREFILL_OUTPUT",
             "DGPP_L2_PREFETCH", "DGPP_L2_PREFETCH_MB", "DGPP_L2_PREFETCH_BOUNDARY", "DGPP_L2_PREFETCH_LAYER",
             // The bus timeline switch and the dense-lowering A/B switches: every rank the same.
             "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD"};

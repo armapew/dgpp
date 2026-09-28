@@ -63,6 +63,17 @@ class SiteEnvTest(unittest.TestCase):
         self.assertEqual(site_env.site_nodes(values), ["override"])
         self.assertEqual(site_env.ssh_user(values), "other")
 
+    def test_qwen_runtime_options_survive_site_file_and_resolution(self):
+        options = {"DGPP_QSA_QUERY_TILE": "2", "DGPP_QSA_DECODE_PARTS": "8",
+                   "DGPP_DENSE_CACHE_MIB": "4096", "DGPP_BATCH_PREFILL": "1",
+                   "DGPP_SKIP_PREFILL_OUTPUT": "1"}
+        with self.env_file.open("a") as f:
+            for key, value in options.items():
+                f.write(f"{key}={value}\n")
+        config = site_env.resolve_config(self.config, self.values())
+        for node in config["node_env"]:
+            self.assertEqual({key: node[key] for key in options}, options)
+
     def test_repo_env_is_found_without_explicit_path(self):
         with patch.object(site_env, "ROOT", self.root):
             values = site_env.settings({})
