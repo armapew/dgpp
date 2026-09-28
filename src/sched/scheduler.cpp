@@ -707,6 +707,28 @@ void Scheduler::advance_prefill(int arrival, int64_t budget) {
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - started).count();
   prefill_ms_ += ms;
+  apply_prefill_progress(arrival, budget, progress, ms);
+}
+
+void Scheduler::advance_prefills(const std::vector<int>& arrivals, int64_t budget) {
+  if (arrivals.size() <= 1 || !engine_->supports_grouped_prefill_advance()) {
+    for (int arrival : arrivals) advance_prefill(arrival, budget);
+    return;
+  }
+  std::vector<int> slots;
+  for (int arrival : arrivals) slots.push_back(requests_[static_cast<size_t>(arrival)].slot);
+  const auto started = std::chrono::steady_clock::now();
+  const auto progress = engine_->advance_prefill_group(slots, budget);
+  const double ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - started).count();
+  prefill_ms_ += ms;
+  if (progress.size() != arrivals.size()) throw std::runtime_error("Scheduler: incomplete prefill group");
+  for (size_t i = 0; i < arrivals.size(); ++i) apply_prefill_progress(arrivals[i], budget, progress[i], ms);
+}
+
+void Scheduler::apply_prefill_progress(int arrival, int64_t budget,
+    const SchedulerEngine::PrefillProgress& progress, double ms) {
+  Request& r = requests_[static_cast<size_t>(arrival)];
   r.prefill_ms += ms;
   if (progress.computed_tokens <= 0 || progress.computed_tokens > budget)
     throw std::runtime_error("Scheduler: prefill chunk made no progress or exceeded its token budget");
@@ -1224,7 +1246,54 @@ bool Scheduler::quantum() {
         ? policy_.prefill_idle_budget_tokens : policy_.prefill_budget_tokens;
   };
   const int64_t budget = prefill_budget();
-  if (prefill_in_flight) {
+  if (budget > 0 && engine_->supports_grouped_prefill_advance()) {
+    std::vector<int> inflight;
+    for (size_t i = 0; i < requests_.size(); ++i)
+      if (requests_[i].state == State::kPrefilling) inflight.push_back(static_cast<int>(i));
+    const int64_t align = engine_->prefill_chunk_alignment();
+    const size_t max_advances = static_cast<size_t>(budget / align);
+    // Open fitting continuations before walking any of them. In particular,
+    // a warm suffix that fits one tick must not finish before its peers can
+    // join the same forward. Reservation and prefix ownership remain per slot.
+    while (free_slot() >= 0 && inflight.size() < max_advances) {
+      int next = -1;
+      if (inflight.empty()) {
+        next = next_admissible();
+      } else {
+        const int64_t free_blocks = engine_->pool_blocks_total() - engine_->pool_blocks_in_use();
+        for (size_t i = 0; i < requests_.size(); ++i) {
+          if (requests_[i].state != State::kQueued) continue;
+          if (new_blocks(requests_[i], plan_prefix(requests_[i])) <= free_blocks) {
+            next = static_cast<int>(i);
+            break;
+          }
+        }
+      }
+      if (next < 0) break;
+      const auto& r = requests_[static_cast<size_t>(next)];
+      if (!r.spec.images.empty() && !engine_->supports_image_chunked_prefill()) break;
+      begin_prefill(next, budget);
+      inflight.push_back(next);
+      admitted_any = true;
+    }
+    std::sort(inflight.begin(), inflight.end());
+    if (inflight.size() > max_advances) {
+      const auto next = std::upper_bound(inflight.begin(), inflight.end(), prefill_cursor_);
+      std::rotate(inflight.begin(), next, inflight.end());
+      inflight.resize(max_advances);
+    }
+    if (!inflight.empty()) {
+      const int64_t share = (budget / static_cast<int64_t>(inflight.size()) / align) * align;
+      advance_prefills(inflight, share);
+      progressed = true;
+    } else {
+      int64_t remaining = budget;
+      while (admit_fitting(remaining, budget, !admitted_any)) {
+        admitted_any = true;
+        progressed = true;
+      }
+    }
+  } else if (prefill_in_flight) {
     // A chunked prefill is in flight: advance a fair slice on equal aligned
     // shares of the tick's budget (all prefills when they fit), begin at most
     // one new chunked read-in, and admit fitting one-shots/groups into the
@@ -1269,7 +1338,7 @@ bool Scheduler::quantum() {
       begin_prefill(begin_arrival, share);
       admitted_any = true;
     }
-    for (const int a : inflight) advance_prefill(a, share);
+    advance_prefills(inflight, share);
     progressed = true;
     // The align-down leftover still admits fitting one-shots/groups — but
     // never a new chunked start (chunked read-ins stay one at a time, and

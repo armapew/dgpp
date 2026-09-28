@@ -151,6 +151,74 @@ int audit(QwenModel& ref, const std::vector<int64_t>& prompt, const Transcript& 
 
 // The prefill head must match the diagnostic full head across the GEMV/dense
 // transition. A one-row GEMV substitution fails this gate for long prompts.
+int run_grouped_chunks(const std::string& dir) {
+  const auto cfg = QwenTextConfig::from_json_file((fs::path(dir) / "config.json").string());
+  QwenModel solo(cfg, dir, 128, 2048, QwenResidency::Resident, nullptr, 0, 1, 4, true, 24);
+  QwenModel grouped(cfg, dir, 128, 2048, QwenResidency::Resident, nullptr, 0, 1, 4, true, 24);
+  const int V = solo.lm_vocab_count();
+  std::vector<std::vector<int64_t>> prompts;
+  for (int n = 0; n < 4; ++n) prompts.push_back(smoke_tokens(cfg, 97 + 8 * n, 0x91728 + n * 71));
+  uint8_t* arenas[2][4]{};
+  QwenModel::SessionSnapshotMeta metas[2][4];
+  QwenModel::SnapshotRequest snaps[2][4];
+  for (int model = 0; model < 2; ++model) for (int req = 0; req < 4; ++req) {
+    DGPP_CUDA_OK(cudaMalloc(&arenas[model][req], solo.session_snapshot_bytes()));
+    snaps[model][req].position = 64;
+    snaps[model][req].dst = arenas[model][req];
+    snaps[model][req].meta = &metas[model][req];
+  }
+  for (const bool resumed : {false, true}) {
+    std::vector<QwenModel::PrefillCursor> a, b;
+    for (int req = 0; req < 4; ++req) {
+      if (resumed) {
+        solo.session_attach(req, arenas[0][req], metas[0][req]);
+        grouped.session_attach(req, arenas[1][req], metas[1][req]);
+      }
+      a.push_back(solo.session_prefill_begin(req, prompts[req], 256, 32, {64},
+          resumed ? nullptr : &snaps[0][req], resumed ? 64 : 0));
+      b.push_back(grouped.session_prefill_begin(req, prompts[req], 256, 32, {64},
+          resumed ? nullptr : &snaps[1][req], resumed ? 64 : 0));
+    }
+    for (;;) {
+      std::vector<QwenModel::PrefillCursor*> pending;
+      for (int req = 0; req < 4; ++req) if (a[req].next < a[req].end) {
+        solo.session_prefill_advance(a[req], 32);
+        pending.push_back(&b[req]);
+      }
+      if (pending.empty()) break;
+      grouped.session_prefill_advance_group(pending, 32);
+      for (int req = 0; req < 4; ++req)
+        require(a[req].next == b[req].next && a[req].suspended == b[req].suspended,
+                "grouped continuation changes position or suspension");
+    }
+    for (int req = 0; req < 4; ++req) {
+      require(snaps[0][req].taken && snaps[1][req].taken, "group preserves each snapshot cut");
+      const auto compare = [&](const auto& want, const auto& got, const char* what) {
+        const auto c = compare_row(got.logits.data(), want.logits.data(), V);
+        std::printf("[ .. ] grouped chunks %s req %d resumed %d: l2 %.6g\n", what, req, resumed, c.l2);
+        require(c.l2 < 0.1, std::string("grouped chunk ") + what + " exceeds prefill l2 budget");
+      };
+      compare(a[req].output, b[req].output, "target");
+      int64_t token = argmax(a[req].output.logits.data(), V);
+      for (int step = 0; step < 4; ++step) {
+        compare(solo.session_draft(req, {token}), grouped.session_draft(req, {token}), "draft");
+        const auto want = solo.session_step(req, token), got = grouped.session_step(req, token);
+        compare(want, got, "decode");
+        token = argmax(want.logits.data(), V);
+      }
+      solo.session_close(req);
+      grouped.session_close(req);
+    }
+  }
+  for (int req = 0; req < 4; ++req) {
+    solo.session_release_snapshot(metas[0][req]);
+    grouped.session_release_snapshot(metas[1][req]);
+    for (int model = 0; model < 2; ++model) DGPP_CUDA_OK(cudaFree(arenas[model][req]));
+  }
+  require(solo.kv_blocks_in_use() == 0 && grouped.kv_blocks_in_use() == 0, "all grouped cache blocks released");
+  return 0;
+}
+
 int run_grouped_mtp(const std::string& dir) {
   const auto cfg = QwenTextConfig::from_json_file((fs::path(dir) / "config.json").string());
   QwenModel solo(cfg, dir, 512, 2048, QwenResidency::Resident, nullptr, 0, 1, 4, true, 24);
@@ -1056,6 +1124,7 @@ int run_checkpoint(const std::string& dir, const std::vector<int64_t>& ids, int 
 int main(int argc, char** argv) {
   std::string fixture, checkpoint, ids_text;
   bool fp8_head = false, prefill_head = false, dense_cache = false, grouped_mtp = false;
+  bool grouped_chunks = false;
   int steps = 4;
   int layers_extra = -1;
   for (int i = 1; i < argc; ++i) {
@@ -1069,12 +1138,15 @@ int main(int argc, char** argv) {
       dense_cache = true;
     else if (a == "--grouped-mtp")
       grouped_mtp = true;
+    else if (a == "--grouped-chunks")
+      grouped_chunks = true;
     else if (a == "--checkpoint-dir" && i + 1 < argc) checkpoint = argv[++i];
     else if (a == "--ids" && i + 1 < argc) ids_text = argv[++i];
     else if (a == "--steps" && i + 1 < argc) steps = std::stoi(argv[++i]);
     else if (a == "--layers" && i + 1 < argc) layers_extra = std::stoi(argv[++i]);
   }
   try {
+    if (!fixture.empty() && grouped_chunks) return run_grouped_chunks(fixture);
     if (!fixture.empty() && grouped_mtp) return run_grouped_mtp(fixture);
     if (!fixture.empty()) return dense_cache ? run_dense_cache(fixture) :
         (prefill_head ? run_prefill_head(fixture) : run_fixture(fixture, fp8_head));

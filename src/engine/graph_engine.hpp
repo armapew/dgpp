@@ -1056,9 +1056,8 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
                 task->boundaries, snap, plan.attach_position);
           }
         }());
-        task->advance = [this, req, cursor, task = task.get()](int64_t budget) {
-          const int64_t start = cursor->next;
-          const bool done = model_->session_prefill_advance(*cursor, budget);
+        task->cursor = cursor;
+        task->finish = [this, req, cursor, task = task.get()](int64_t start, bool done) {
           if (task->snap.taken && !task->plan.snap_taken) {
             arena_.commit(task->plan.snap_slot, task->snap);
             task->plan.snap_taken = true;
@@ -1073,6 +1072,11 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
           progress.snap_taken = task->plan.snap_taken;
           if (done) progress.first_token = open_slot_finish(req, task->prompt, cursor->output);
           return progress;
+        };
+        task->advance = [this, cursor, task = task.get()](int64_t budget) {
+          const int64_t start = cursor->next;
+          const bool done = model_->session_prefill_advance(*cursor, budget);
+          return task->finish(start, done);
         };
         prefills_[static_cast<size_t>(req)] = std::move(task);
       } catch (...) {
@@ -1101,6 +1105,57 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       close_failed_slot(req);
       reseed_live_feeds();
       throw;
+    }
+  }
+  bool supports_grouped_prefill_advance() const override {
+    if constexpr (requires { Model::kGroupedChunkPrefill; }) {
+      const char* enabled = std::getenv("DGPP_BATCH_PREFILL");
+      return Model::kGroupedChunkPrefill && world_ == 1 && enabled && enabled[0] == '1';
+    }
+    return false;
+  }
+  std::vector<sched::SchedulerEngine::PrefillProgress> advance_prefill_group(
+      const std::vector<int>& reqs, int64_t budget) override {
+    if constexpr (requires { Model::kGroupedChunkPrefill; }) {
+      if (!supports_grouped_prefill_advance() || reqs.size() <= 1)
+        return sched::SchedulerEngine::advance_prefill_group(reqs, budget);
+      drain();
+      std::vector<typename Model::PrefillCursor*> cursors;
+      std::vector<int64_t> starts;
+      for (int req : reqs) {
+        check_req(req);
+        auto& task = prefills_[static_cast<size_t>(req)];
+        if (!task) throw std::logic_error("graph engine: no pending grouped prefill");
+        auto* cursor = static_cast<typename Model::PrefillCursor*>(task->cursor.get());
+        cursors.push_back(cursor);
+        starts.push_back(cursor->next);
+      }
+      try {
+        const auto done = model_->session_prefill_advance_group(cursors, budget);
+        std::vector<sched::SchedulerEngine::PrefillProgress> result;
+        for (size_t i = 0; i < reqs.size(); ++i) {
+          auto& task = prefills_[static_cast<size_t>(reqs[i])];
+          result.push_back(task->finish(starts[i], done[i]));
+          if (done[i]) task.reset();
+        }
+        reseed_live_feeds();
+        return result;
+      } catch (...) {
+        for (int req : reqs) {
+          auto& task = prefills_[static_cast<size_t>(req)];
+          if (task) {
+            if (task->snap.taken && !task->plan.snap_taken) arena_.commit(task->plan.snap_slot, task->snap);
+            if (task->body_snap.taken && !task->plan.body_snap_taken)
+              arena_.commit(task->plan.body_snap_slot, task->body_snap);
+            task.reset();
+          }
+          close_failed_slot(req);
+        }
+        reseed_live_feeds();
+        throw;
+      }
+    } else {
+      return sched::SchedulerEngine::advance_prefill_group(reqs, budget);
     }
   }
   // The group prefill: several cold prompts as the spans of one forward
@@ -1507,6 +1562,8 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     sched::SchedulerEngine::PrefixPrefill plan;
     typename Model::SnapshotRequest snap, body_snap;
     std::function<sched::SchedulerEngine::PrefillProgress(int64_t)> advance;
+    std::function<sched::SchedulerEngine::PrefillProgress(int64_t, bool)> finish;
+    std::shared_ptr<void> cursor;
   };
   std::vector<std::unique_ptr<PendingPrefill>> prefills_;
 

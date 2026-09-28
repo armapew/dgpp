@@ -276,6 +276,12 @@ class SchedulerEngine {
   virtual PrefillProgress advance_prefill(int, int64_t = 0) {
     throw std::logic_error("SchedulerEngine: resumable prefill is unavailable");
   }
+  virtual bool supports_grouped_prefill_advance() const { return false; }
+  virtual std::vector<PrefillProgress> advance_prefill_group(const std::vector<int>& reqs, int64_t budget) {
+    std::vector<PrefillProgress> result;
+    for (int req : reqs) result.push_back(advance_prefill(req, budget));
+    return result;
+  }
   virtual int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
                                  PrefixPrefill* plan) {
     (void)req;
@@ -675,6 +681,9 @@ class Scheduler {
   void admit(int arrival);
   void begin_prefill(int arrival, int64_t budget);
   void advance_prefill(int arrival, int64_t budget);
+  void advance_prefills(const std::vector<int>& arrivals, int64_t budget);
+  void apply_prefill_progress(int arrival, int64_t budget,
+                              const SchedulerEngine::PrefillProgress& progress, double ms);
   // The chunked-prefill predicate behind the admit dispatch: a positive
   // budget, chunkable inputs (plain text, or images on an engine that
   // chunks them), and a prompt longer than one tick's budget.

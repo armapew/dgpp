@@ -1416,6 +1416,17 @@ bool QwenModel::session_prefill_advance(PrefillCursor& cursor, int64_t chunk_tok
   return done;
 }
 
+std::vector<bool> QwenModel::session_prefill_advance_group(
+    const std::vector<PrefillCursor*>& cursors, int64_t chunk_tokens) {
+  if (std::any_of(cursors.begin(), cursors.end(), [](const auto* c) { return c && c->images; })) {
+    std::vector<bool> done;
+    for (auto* c : cursors) done.push_back(session_prefill_advance(*c, chunk_tokens));
+    return done;
+  }
+  std::vector<Base::PrefillCursor*> base(cursors.begin(), cursors.end());
+  return Base::session_prefill_advance_group(base, chunk_tokens);
+}
+
 QwenModel::Outputs QwenModel::session_prefill_with_images(
     int req, const std::vector<int64_t>& ids, const std::vector<ImageInput>& images,
     const std::vector<int64_t>& boundaries, SnapshotRequest* snap, bool resume) {

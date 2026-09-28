@@ -145,6 +145,7 @@ class QwenModel : public SessionModel<QwenModel> {
   static constexpr int prefill_chunk_tokens() { return kPrefillChunkTokens; }
   static constexpr int decode_rows_cap() { return kDecodeRowsMax; }
   static constexpr bool kResumablePrefill = true;
+  static constexpr bool kGroupedChunkPrefill = true;
   static constexpr bool kCompactBatches = true;
   static constexpr int kv_block_tokens_static() { return kBlockTokens; }
   // The same number for a shape that is not built yet (the memory plan).
@@ -200,6 +201,8 @@ class QwenModel : public SessionModel<QwenModel> {
                                       SnapshotRequest* snap = nullptr, int64_t attach_position = 0,
                                       const std::vector<ImageInput>* images = nullptr);
   bool session_prefill_advance(PrefillCursor& cursor, int64_t chunk_tokens = 0);
+  std::vector<bool> session_prefill_advance_group(const std::vector<PrefillCursor*>& cursors,
+                                                int64_t chunk_tokens);
   void graph_prepare();
   void mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, int T, bool decode_row,
                     bool capture, int head_rows, int batch_requests, int prefill_row_offset = 0);

@@ -192,6 +192,8 @@ class SessionModel : public PrefillReporting {
   // -1 between calls so padded decode graphs cannot advance its state.
   // A positive override changes this chunk's budget; zero uses the begin budget.
   bool session_prefill_advance(PrefillCursor& cursor, int64_t chunk_tokens = 0);
+  std::vector<bool> session_prefill_advance_group(const std::vector<PrefillCursor*>& cursors,
+                                                int64_t chunk_tokens);
   Outputs session_step(int req, int64_t token_id) { return session_verify(req, std::vector<int64_t>{token_id}); }
   Outputs session_verify(int req, const std::vector<int64_t>& token_ids);
   void session_rollback(int req, int accepted);
@@ -939,6 +941,108 @@ bool SessionModel<D>::session_prefill_advance(PrefillCursor& cursor, int64_t chu
     DGPP_CUDA_OK(cudaMemsetAsync(d_session_pos_ + cursor.req, 0xff, sizeof(int64_t), stream_));
     if (mtp_) DGPP_CUDA_OK(cudaMemsetAsync(d_mtp_pos_ + cursor.req, 0xff, sizeof(int64_t), stream_));
     cursor.suspended = true;
+  }
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  return done;
+}
+
+template <class D>
+std::vector<bool> SessionModel<D>::session_prefill_advance_group(
+    const std::vector<PrefillCursor*>& cursors, int64_t budget) {
+  if (cursors.empty() || derived().prefill_group_span_limit() <= 0)
+    throw std::invalid_argument("session_prefill_advance_group: unsupported or empty group");
+  if (budget < snapshot_align_ || budget > max_tokens_ || budget % snapshot_align_ != 0)
+    throw std::invalid_argument("session_prefill_advance_group: invalid chunk budget");
+  if (cursors.size() == 1) return {session_prefill_advance(*cursors[0], budget)};
+  std::vector<int64_t> ids, positions, ends;
+  std::vector<int32_t> reqs, lengths;
+  for (auto* cursor : cursors) {
+    if (!cursor) throw std::invalid_argument("session_prefill_advance_group: null cursor");
+    check_req(cursor->req, "session_prefill_advance_group");
+    if (cursor->next >= cursor->end || session_pos_[cursor->req] != cursor->next ||
+        std::find(reqs.begin(), reqs.end(), cursor->req) != reqs.end())
+      throw std::logic_error("session_prefill_advance_group: completed, stale or duplicate cursor");
+    int64_t end = cursor->cut_index < cursor->cuts.size() ? cursor->cuts[cursor->cut_index] : cursor->end;
+    end = std::min(end, (cursor->next / budget + 1) * budget);
+    const auto* first = cursor->ids + cursor->next - cursor->start;
+    ids.insert(ids.end(), first, first + end - cursor->next);
+    positions.push_back(cursor->next);
+    ends.push_back(end);
+    reqs.push_back(cursor->req);
+    lengths.push_back(static_cast<int32_t>(end - cursor->next));
+  }
+  if (ids.size() > static_cast<size_t>(max_tokens_))
+    throw std::invalid_argument("session_prefill_advance_group: group exceeds max_tokens");
+  for (auto* cursor : cursors) {
+    if (cursor->suspended) {
+      push_position(cursor->req);
+      if (mtp_) push_mtp_position(cursor->req);
+      cursor->suspended = false;
+    }
+  }
+  RowRun run;
+  run.req = reqs[0];
+  run.ids = ids.data();
+  run.T = static_cast<int>(ids.size());
+  run.pos0 = positions[0];
+  run.span_reqs = reqs.data();
+  run.span_pos0 = positions.data();
+  run.span_lens = lengths.data();
+  run.num_spans = static_cast<int>(cursors.size());
+  Outputs all = derived().run_rows(run);
+  std::vector<bool> done(cursors.size());
+  size_t offset = 0;
+  for (size_t s = 0; s < cursors.size(); ++s) {
+    auto& c = *cursors[s];
+    auto& out = c.output;
+    const int req = c.req;
+    const int64_t c0 = positions[s], c1 = ends[s];
+    out.lm_vocab_begin = all.lm_vocab_begin;
+    out.lm_vocab_count = all.lm_vocab_count;
+    out.logits.assign(all.logits.begin() + s * lm_vocab_count_, all.logits.begin() + (s + 1) * lm_vocab_count_);
+    out.final_hidden_bits.assign(all.final_hidden_bits.begin() + s * hidden_,
+                                 all.final_hidden_bits.begin() + (s + 1) * hidden_);
+    const auto append_rows = [&](const auto& src, auto& dst) {
+      if (dst.size() < src.size()) dst.resize(src.size());
+      for (size_t l = 0; l < src.size(); ++l) {
+        if (src[l].size() % ids.size() != 0)
+          throw std::logic_error("session_prefill_advance_group: invalid captured row shape");
+        const size_t width = src[l].size() / ids.size();
+        dst[l].insert(dst[l].end(), src[l].begin() + offset * width,
+                       src[l].begin() + (offset + lengths[s]) * width);
+      }
+    };
+    append_rows(all.route_ids, out.route_ids);
+    append_rows(all.route_weights, out.route_weights);
+    append_rows(all.layer_states, out.layer_states);
+    append_rows(all.dsa_selections, out.dsa_selections);
+    session_pos_[req] = c1;
+    push_position(req);
+    if (mtp_) {
+      const int64_t last = std::min(c1, c.end - 1);
+      if (last > c0)
+        mtp_prefill_rows(req, c0, last, c.ids + c0 + 1 - c.start, static_cast<int>(offset));
+      mtp_pos_[req] = std::max(mtp_pos_[req], last);
+      push_mtp_position(req);
+    }
+    c.span_start = c1 == c.end;
+    for (auto* snap = c.snap; snap; snap = snap->next) {
+      if (!snap->taken && snap->position == c1) {
+        *snap->meta = session_snapshot(req, snap->dst);
+        snap->taken = true;
+        c.span_start = true;
+      }
+    }
+    if (c.cut_index < c.cuts.size() && c1 == c.cuts[c.cut_index]) ++c.cut_index;
+    c.next = c1;
+    done[s] = c1 == c.end;
+    if (!done[s]) {
+      DGPP_CUDA_OK(cudaMemsetAsync(d_session_pos_ + req, 0xff, sizeof(int64_t), stream_));
+      if (mtp_) DGPP_CUDA_OK(cudaMemsetAsync(d_mtp_pos_ + req, 0xff, sizeof(int64_t), stream_));
+      c.suspended = true;
+    }
+    report_prefill_progress(req, c1);
+    offset += lengths[s];
   }
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
   return done;

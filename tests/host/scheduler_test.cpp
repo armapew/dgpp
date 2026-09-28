@@ -498,6 +498,62 @@ DGPP_TEST(scheduler_serving_auto_prefill_budget_respects_engine_geometry_and_opt
   require(resolved().prefill_budget_tokens == 0, "unsupported engine keeps synchronous prefill");
 }
 
+DGPP_TEST(scheduler_grouped_chunk_admission_bounds_work_and_cancels_independently) {
+  class Batched : public ChunkFakeEngine {
+   public:
+    int batches = 0;
+    bool supports_grouped_prefill_advance() const override { return true; }
+    std::vector<PrefillProgress> advance_prefill_group(const std::vector<int>& reqs, int64_t budget) override {
+      ++batches;
+      require(reqs.size() * budget <= 8, "group must fit the total tick budget");
+      return SchedulerEngine::advance_prefill_group(reqs, budget);
+    }
+  } engine;
+  engine.arm(0, {10, 11}, 2);
+  engine.arm(1, {20, 21}, 2);
+  dgpp::sched::AdmissionPolicy policy;
+  policy.prefill_budget_tokens = 8;
+  Scheduler sched(&engine, {}, 0, policy);
+  sched.submit(make_request("first", 11, 2));
+  sched.submit(make_request("second", 13, 2));
+  sched.tick();
+  require(engine.batches == 1 && sched.meters().prefilling == 2 &&
+              sched.meters().prompt_tokens_computed == 8 && sched.meters().tokens_generated == 0,
+          "both prompts join the first bounded chunk without publishing tokens");
+  require(sched.cancel("first"), "cancel one member of the group");
+  sched.run_to_completion();
+  require(sched.find("first")->status == Scheduler::Result::Status::kCancelled &&
+              sched.find("second")->generated == std::vector<int64_t>({20, 21}),
+          "the remaining continuation completes independently");
+  require(sched.meters().pool_blocks_in_use == 0 && engine.prefill_monitor()->snapshot().empty(),
+          "group cancellation and completion release all reservations");
+}
+
+DGPP_TEST(scheduler_grouped_short_prefills_join_before_either_finishes) {
+  class Batched : public ChunkFakeEngine {
+   public:
+    int members = 0;
+    bool supports_grouped_prefill_advance() const override { return true; }
+    std::vector<PrefillProgress> advance_prefill_group(const std::vector<int>& reqs, int64_t budget) override {
+      members = static_cast<int>(reqs.size());
+      return SchedulerEngine::advance_prefill_group(reqs, budget);
+    }
+  } engine;
+  engine.arm(0, {10, 11}, 2);
+  engine.arm(1, {20, 21}, 2);
+  dgpp::sched::AdmissionPolicy policy;
+  policy.prefill_budget_tokens = 8;
+  Scheduler sched(&engine, {}, 0, policy);
+  sched.submit(make_request("first", 3, 2));
+  sched.submit(make_request("second", 3, 2));
+  sched.tick();
+  require(engine.members == 2 && sched.meters().prompts_prefilled == 2 &&
+              sched.meters().prompt_tokens_computed == 6, "one physical group serves both short prompts");
+  sched.run_to_completion();
+  require(sched.find("first")->generated == std::vector<int64_t>({10, 11}) &&
+              sched.find("second")->generated == std::vector<int64_t>({20, 21}), "grouped transcripts");
+}
+
 DGPP_TEST(scheduler_chunked_prefill_bounds_work_and_keeps_decode_running) {
   ChunkFakeEngine engine;
   engine.arm(0, {10, 11, 12, 13, 14, 15, 16, 17}, 8);
