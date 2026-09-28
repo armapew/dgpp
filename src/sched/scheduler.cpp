@@ -227,6 +227,45 @@ Scheduler::PrefixPlan Scheduler::plan_prefix(const Request& r) const {
   return plan;
 }
 
+void Scheduler::improve_shared_body_snapshot(size_t arrival) {
+  Request& leader = requests_[arrival];
+  const int64_t old = leader.prefill_body_position, block = prefix_info_.block_tokens;
+  if (leader.prefill_body_slot < 0 || old < 8192 || block <= 0) return;
+  const int64_t lookahead = prefix_info_.prefill_lookahead ? 1 : 0;
+  const int64_t must_match = old + lookahead;
+  int64_t common = static_cast<int64_t>(leader.spec.prompt.size());
+  std::vector<const Request*> followers;
+  for (size_t i = arrival + 1; i < requests_.size(); ++i) {
+    const auto& r = requests_[i];
+    if (r.state != State::kQueued || !cache_on(r) || !r.spec.images.empty() ||
+        r.cancel_requested || r.stop_requested || r.coalesce_wait_ticks >= 128 ||
+        static_cast<int64_t>(r.spec.prompt.size()) < must_match ||
+        !std::equal(r.spec.prompt.begin(), r.spec.prompt.begin() + must_match, leader.spec.prompt.begin()))
+      continue;
+    // Retarget only for requests already able to benefit from this body.
+    if (old - plan_prefix(r).attach_position < 8192) continue;
+    const auto n = std::min(r.spec.prompt.size(), leader.spec.prompt.size());
+    const auto end = std::mismatch(r.spec.prompt.begin(), r.spec.prompt.begin() + n,
+                                    leader.spec.prompt.begin()).first;
+    common = std::min(common, static_cast<int64_t>(end - r.spec.prompt.begin()) - lookahead);
+    followers.push_back(&r);
+  }
+  if (followers.empty()) return;
+  for (auto it = leader.cuts.rbegin(); it != leader.cuts.rend() && *it > old; ++it) {
+    const int64_t cut = *it;
+    if (cut > common || cut >= leader.prefill_snap_position || cut % block != 0) continue;
+    if (!std::all_of(followers.begin(), followers.end(), [&](const Request* r) {
+          return std::binary_search(r->cuts.begin(), r->cuts.end(), cut);
+        })) continue;
+    if (engine_->retarget_prefill_body(leader.slot, leader.prefill_body_slot, cut)) {
+      leader.prefill_body_position = cut;
+      DGPP_LOG_INFO("sched: request '{}' moves its pending shared prefix from {} to {} tokens",
+                    leader.spec.id, old, cut);
+    }
+    break;
+  }
+}
+
 bool Scheduler::awaiting_shared_prefix(size_t arrival) {
   Request& r = requests_[arrival];
   if (!coalesce_prefills_ || policy_.prefill_budget_tokens <= 0 ||
@@ -237,10 +276,11 @@ bool Scheduler::awaiting_shared_prefix(size_t arrival) {
   // snapshot. The dependency graph cannot cycle, and cancellation or a
   // failed/finished leader removes the dependency on the next tick.
   for (size_t i = 0; i < arrival; ++i) {
-    const Request& leader = requests_[i];
+    Request& leader = requests_[i];
     if (leader.state != State::kPrefilling || !cache_on(leader) ||
         !leader.spec.images.empty() || leader.cancel_requested || leader.stop_requested)
       continue;
+    improve_shared_body_snapshot(i);
     const int64_t cuts[] = {
         leader.prefill_snap_slot >= 0 ? leader.prefill_snap_position : 0,
         leader.prefill_body_slot >= 0 ? leader.prefill_body_position : 0};

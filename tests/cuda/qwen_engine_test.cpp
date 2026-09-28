@@ -458,6 +458,78 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
   }
 }
 
+DGPP_TEST(qwen_pending_body_retarget_matches_a_preplanned_snapshot_with_mtp) {
+  struct RestorePrecision {
+    bool fp8 = dgpp::QwenLayerStream::dense_weights_fp8();
+    ~RestorePrecision() { dgpp::QwenLayerStream::set_dense_weights_fp8(fp8); }
+  } restore;
+  dgpp::QwenLayerStream::set_dense_weights_fp8(true);
+  const auto cfg = qwenfx::tiny_nvfp4_config();
+  const std::string dir = "qwen_body_retarget_fixture";
+  qwenfx::write_fixture(cfg, dir, qwenfx::tiny_text_json(), qwenfx::tiny_nvfp4_quant_json());
+  const auto prompt = smoke_tokens(cfg, 901, 9173);
+  const std::vector<int64_t> cuts{256, 512, 640, 768};
+  for (int depth : {1, 2, 5}) {
+    auto buses = start_world(1, kPort + 31);
+    QwenModel model(cfg, dir, 1024, 8192, QwenResidency::Resident, nullptr, 0, 1, 4,
+                    true, 4 * (depth + 1), true, true);
+    uint16_t* scratch = nullptr;
+    DGPP_CUDA_OK(cudaHostAlloc(reinterpret_cast<void**>(&scratch),
+        sizeof(uint16_t) * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
+    {
+      GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
+          cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 0, nullptr, 4, depth, false);
+      for (bool attach : {false, true}) {
+        std::array<int32_t, 2> first;
+        for (int req = 0; req < 2; ++req) {
+          dgpp::sched::SchedulerEngine::PrefixPrefill plan;
+          plan.boundaries = &cuts;
+          if (attach) { plan.attach_slot = 2 * req + 1; plan.attach_position = 512; }
+          else {
+            plan.snap_slot = 2 * req; plan.snap_position = 768;
+            plan.body_snap_slot = 2 * req + 1; plan.body_snap_position = req == 0 ? 256 : 512;
+          }
+          graph.begin_prefill(req, prompt, 1024, 128, plan);
+          auto progress = graph.advance_prefill(req, 128);
+          if (!attach && req == 0) {
+            require(!graph.retarget_prefill_body(req, 3, 512), "wrong arena slot is refused");
+            require(!graph.retarget_prefill_body(req, 1, 516), "partial-block snapshot needs no new headroom");
+            require(!graph.retarget_prefill_body(req, 1, 768), "body remains before the deepest snapshot");
+            require(graph.retarget_prefill_body(req, 1, 512), "future existing body cut can move forward");
+          }
+          int64_t position = (attach ? 512 : 0) + progress.computed_tokens;
+          while (progress.first_token < 0) {
+            progress = graph.advance_prefill(req, 128);
+            position += progress.computed_tokens;
+            if (!attach && req == 0 && position == 512)
+              require(!graph.retarget_prefill_body(req, 1, 640), "a taken snapshot cannot be retargeted");
+          }
+          first[req] = progress.first_token;
+          if (!attach) require(progress.body_snap_taken && progress.snap_taken, "both snapshots commit");
+          graph.reserve(req, 1024);
+        }
+        require(first[0] == first[1], "retargeted and preplanned snapshot paths agree at prefill completion");
+        for (int step = 0; step < 4; ++step) {
+          const auto outputs = graph.step_batch({0, 1});
+          require(outputs[0] == outputs[1], "retargeted cache preserves target/draft continuation tokens");
+        }
+        graph.close(0); graph.close(1);
+      }
+      for (int slot = 0; slot < 4; ++slot) graph.prefix_release(slot);
+      dgpp::sched::SchedulerEngine::PrefixPrefill plan;
+      plan.boundaries = &cuts; plan.snap_slot = 0; plan.snap_position = 768;
+      plan.body_snap_slot = 1; plan.body_snap_position = 256;
+      graph.begin_prefill(2, prompt, 1024, 128, plan);
+      graph.advance_prefill(2, 128);
+      require(graph.retarget_prefill_body(2, 1, 512), "retarget before cancellation");
+      graph.close(2); graph.prefix_release(0); graph.prefix_release(1); graph.drain();
+      require(graph.pool_blocks_in_use() == 0, "cancelling a retargeted prefill releases all blocks");
+    }
+    DGPP_CUDA_OK(cudaFreeHost(scratch));
+    std::printf("[ OK ] body retarget, cached attach and cancellation, MTP depth %d\n", depth);
+  }
+}
+
 DGPP_TEST(qwen_engines_world_of_one_request_bound_preserves_mtp_and_slot_reuse) {
   struct RestoreModes {
     bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();

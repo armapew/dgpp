@@ -604,6 +604,57 @@ DGPP_TEST(scheduler_prefix_coalescing_checks_mtp_lookahead_and_has_a_wait_limit)
   }
 }
 
+DGPP_TEST(scheduler_shared_body_moves_only_to_a_cut_usable_by_every_waiter) {
+  class RetargetEngine : public CoalesceEngine {
+   public:
+    int moves = 0;
+    std::map<int, PrefixPrefill> plans;
+    std::map<int, int64_t> positions;
+    void begin_prefill(int req, const std::vector<int64_t>& prompt, int64_t reserve,
+                       int64_t budget, const PrefixPrefill& plan) override {
+      CoalesceEngine::begin_prefill(req, prompt, reserve, budget, plan);
+      plans[req] = plan; positions[req] = plan.attach_position;
+    }
+    PrefillProgress advance_prefill(int req, int64_t budget = 0) override {
+      const auto result = CoalesceEngine::advance_prefill(req, budget);
+      positions[req] += result.computed_tokens;
+      return result;
+    }
+    bool retarget_prefill_body(int req, int slot, int64_t position) override {
+      auto& p = plans.at(req);
+      if (p.body_snap_slot != slot || positions.at(req) >= p.body_snap_position ||
+          position <= p.body_snap_position || position >= p.snap_position) return false;
+      p.body_snap_position = position;
+      pinned_positions_[slot] = position;
+      pinned_[slot] = blocks_for_tokens(position);
+      ++moves;
+      return true;
+    }
+  };
+  for (int variant : {0, 1, 2}) {
+    CoalesceEnv env;
+    RetargetEngine engine;
+    engine.prefill_lookahead_ = variant == 2;
+    dgpp::sched::AdmissionPolicy policy; policy.prefill_budget_tokens = 4096;
+    Scheduler sched(&engine, {}, 0, policy);
+    for (int i = 0; i < 3; ++i) {
+      auto r = make_request("r" + std::to_string(i), 20101, 1);
+      r.boundaries = {20096};
+      r.prompt[19500] = i + 20;
+      if (i == 2 && variant == 1) r.prompt[17000] = 101;
+      if (i == 2 && variant == 2) r.prompt[18432] = 101;
+      sched.submit(std::move(r));
+    }
+    sched.run_to_completion();
+    const int64_t cut = variant == 0 ? 18432 : 16384;
+    require(engine.moves == (variant == 0 ? 1 : 0), "preserve the common cut and MTP lookahead for all waiters");
+    require(sched.meters().prompt_tokens_computed == 20101 + 2 * (20101 - cut),
+            "retargeted cache metadata and suffix accounting must agree");
+    require(sched.meters().pool_blocks_in_use == sched.meters().prefix_blocks_pinned,
+            "retargeted snapshots leave no active reservation");
+  }
+}
+
 DGPP_TEST(scheduler_grouped_chunk_admission_bounds_work_and_cancels_independently) {
   class Batched : public ChunkFakeEngine {
    public:

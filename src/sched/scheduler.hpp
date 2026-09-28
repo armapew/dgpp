@@ -276,6 +276,9 @@ class SchedulerEngine {
   virtual PrefillProgress advance_prefill(int, int64_t = 0) {
     throw std::logic_error("SchedulerEngine: resumable prefill is unavailable");
   }
+  // Move an untaken body snapshot forward to an existing, whole-KV-block
+  // boundary. No new arena slot or partial-block headroom may be required.
+  virtual bool retarget_prefill_body(int, int, int64_t) { return false; }
   virtual bool supports_grouped_prefill_advance() const { return false; }
   virtual std::vector<PrefillProgress> advance_prefill_group(const std::vector<int>& reqs, int64_t budget) {
     std::vector<PrefillProgress> result;
@@ -622,6 +625,7 @@ class Scheduler {
   }
   PrefixPlan plan_prefix(const Request& r) const;
   bool awaiting_shared_prefix(size_t arrival);
+  void improve_shared_body_snapshot(size_t leader);
   void finish_prefill_snapshot(Request& r, int slot, int64_t position, bool taken);
   // The pool block a snapshot's private partial-block copy takes: one when
   // the position is not block-aligned, none otherwise (or without a pool).

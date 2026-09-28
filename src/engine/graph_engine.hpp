@@ -1107,6 +1107,24 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       throw;
     }
   }
+  bool retarget_prefill_body(int req, int slot, int64_t position) override {
+    if constexpr (requires { typename Model::PrefillCursor; }) {
+      if (world_ != 1 || req < 0 || req >= slots_ || model_->kv_block_tokens() <= 0 ||
+          position % model_->kv_block_tokens() != 0) return false;
+      auto& task = prefills_[static_cast<size_t>(req)];
+      if (!task || !task->images.empty() || task->plan.body_snap_slot != slot ||
+          task->body_snap.taken || position <= task->body_snap.position ||
+          position >= task->plan.snap_position) return false;
+      const auto cursor = std::static_pointer_cast<typename Model::PrefillCursor>(task->cursor);
+      if (position <= cursor->next ||
+          !std::binary_search(cursor->cuts.begin(), cursor->cuts.end(), position)) return false;
+      drain();
+      task->body_snap.position = position;
+      task->plan.body_snap_position = position;
+      return true;
+    }
+    return false;
+  }
   bool supports_grouped_prefill_advance() const override {
     if constexpr (requires { Model::kGroupedChunkPrefill; }) {
       const char* enabled = std::getenv("DGPP_BATCH_PREFILL");
