@@ -374,7 +374,7 @@ void rank_work_mtp(int r, const QwenTextConfig& cfg, const std::string& dir, con
 
 }  // namespace
 
-DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
+static void check_grouped_continuations(bool shortlist) {
   const char* old = std::getenv("DGPP_BATCH_PREFILL");
   struct Restore {
     bool had; std::string value;
@@ -387,6 +387,12 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
       dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
     }
   } restore{old != nullptr, old ? old : ""};
+  const char* draft_old = std::getenv("DGPP_DRAFT_VOCAB_LIMIT");
+  struct RestoreDraft {
+    bool had; std::string value;
+    ~RestoreDraft() { if (had) setenv("DGPP_DRAFT_VOCAB_LIMIT", value.c_str(), 1);
+                     else unsetenv("DGPP_DRAFT_VOCAB_LIMIT"); }
+  } draft_restore{draft_old != nullptr, draft_old ? draft_old : ""};
   setenv("DGPP_BATCH_PREFILL", "1", 1);
   dgpp::QwenLayerStream::set_dense_weights_fp8(true);
   const auto cfg = qwenfx::tiny_nvfp4_config();
@@ -396,7 +402,8 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
   for (int i = 0; i < 4; ++i) prompts.push_back(smoke_tokens(cfg, 73 + i * 12, 7138 + i * 7919));
   std::vector<std::vector<int32_t>> reference[6];
   for (bool mapped : {false, true}) {
-  dgpp::QwenLayerStream::set_ngram_table_mmap(mapped);
+  dgpp::QwenLayerStream::set_ngram_table_mmap(shortlist || mapped);
+  if (shortlist) setenv("DGPP_DRAFT_VOCAB_LIMIT", mapped ? "256" : "0", 1);
   for (int depth : {1, 2, 5}) {
     std::vector<std::vector<int32_t>> observed(4);
     auto buses = start_world(1, kPort + 29);
@@ -473,6 +480,14 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
     std::printf("[ OK ] grouped cold/cached graph continuations, four slots, MTP depth %d, mmap %d\n", depth, mapped);
   }
 }
+}
+
+DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
+  check_grouped_continuations(false);
+}
+
+DGPP_TEST(qwen_draft_shortlist_preserves_grouped_cache_and_mtp_transcripts) {
+  check_grouped_continuations(true);
 }
 
 DGPP_TEST(qwen_pending_body_retarget_matches_a_preplanned_snapshot_with_mtp) {

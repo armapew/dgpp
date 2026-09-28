@@ -601,6 +601,42 @@ DGPP_TEST(scale_gemm_gemv_path_propagates_nan_exactly) {
 // TU: minijson does not mix with nvcc).
 int run_scale_gemm_checkpoint_parity(const char* checkpoint_dir);
 
+DGPP_TEST(draft_head_prefix_keeps_selected_logits_exact_in_graphs) {
+  for (int rows : {1, 2, 4, 8, 24}) {
+    const Problem p = make_problem(rows, 1024, 2560, 0xDAAF + rows);
+    uint16_t* act = nullptr; uint8_t* w = nullptr; float* scales = nullptr; float* out = nullptr;
+    DGPP_CUDA_OK(cudaMallocManaged(&act, p.act.size() * 2));
+    DGPP_CUDA_OK(cudaMallocManaged(&w, p.payload.size()));
+    DGPP_CUDA_OK(cudaMallocManaged(&scales, p.scales.size() * 4));
+    DGPP_CUDA_OK(cudaMallocManaged(&out, rows * p.n * 4));
+    std::memcpy(act, p.act.data(), p.act.size() * 2);
+    std::memcpy(w, p.payload.data(), p.payload.size());
+    std::memcpy(scales, p.scales.data(), p.scales.size() * 4);
+    cudaStream_t stream; DGPP_CUDA_OK(cudaStreamCreate(&stream));
+    for (int mma : {0, 1, 5}) {
+      const auto full = run_kernel_f32(p, mma);
+      cudaGraph_t graph; cudaGraphExec_t exec;
+      DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+      dgpp::launch_draft_head_prefix_fp8_f32(act, w, scales, out, rows, p.n, p.k, 256, mma, stream);
+      DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+      DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, 0));
+      for (int replay = 0; replay < 2; ++replay) {
+        DGPP_CUDA_OK(cudaMemsetAsync(out, 0x11, rows * p.n * 4, stream));
+        DGPP_CUDA_OK(cudaGraphLaunch(exec, stream)); DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        for (int row = 0; row < rows; ++row) for (int col = 0; col < p.n; ++col) {
+          const int i = row * p.n + col;
+          if (col < 256 || col >= p.n - 128)
+            require(std::memcmp(out + i, full.data() + i, 4) == 0, "selected draft logit changed");
+          else require(std::isinf(out[i]) && out[i] < 0, "excluded draft logit is stale");
+        }
+      }
+      DGPP_CUDA_OK(cudaGraphExecDestroy(exec)); DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    }
+    DGPP_CUDA_OK(cudaStreamDestroy(stream));
+    cudaFree(act); cudaFree(w); cudaFree(scales); cudaFree(out);
+  }
+}
+
 int main(int argc, char** argv) {
   int devices = 0;
   const cudaError_t err = cudaGetDeviceCount(&devices);

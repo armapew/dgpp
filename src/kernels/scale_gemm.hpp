@@ -78,6 +78,14 @@ void launch_scale_gemm_f32(const uint16_t* act, size_t act_row_stride_elems,
                            int mma_from_rows = 0, bool last_row_only = false, void* ws = nullptr,
                            size_t ws_bytes = 0, int compact_row = -1);
 
+// Experimental draft-only shortlist: score the leading `limit` vocabulary
+// rows and the last 128 rows, leaving other draft logits at -infinity. The
+// target still scores the entire vocabulary. No extra weight allocation.
+void launch_draft_head_prefix_fp8_f32(const uint16_t* act, const uint8_t* weights,
+                                      const float* scales, float* logits, int rows,
+                                      int vocab, int hidden, int limit, int mma_from_rows,
+                                      cudaStream_t stream);
+
 // The tile kernel regardless of m (the bf16 mma.sync m16n8k16 path the
 // large-m route takes): the reference the grouped tensor-core MoE kernel is
 // pinned bitwise against (glm_moe_test) — the routed launcher above would

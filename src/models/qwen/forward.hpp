@@ -226,6 +226,7 @@ class QwenModel : public SessionModel<QwenModel> {
 
  private:
   const bool fp8_head_mma_;
+  int draft_vocab_limit_ = 0;
   const bool compact_logits_;
   static constexpr int kBlockTokens = 64;
   static constexpr int kPrefillChunkTokens = 4096;

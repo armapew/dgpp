@@ -76,6 +76,18 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
   loader_.set_reader_stream(stream_);
   const int H = cfg_.hidden_size, W = cfg_.hc_count * H;
   globals_ = loader_.load_globals();
+  if (const char* value = std::getenv("DGPP_DRAFT_VOCAB_LIMIT")) {
+    char* end = nullptr;
+    const long limit = std::strtol(value, &end, 10);
+    if (end == value || *end || limit < 0 || limit > cfg_.vocab_size || limit % 128)
+      throw std::invalid_argument("DGPP_DRAFT_VOCAB_LIMIT: expected an aligned vocabulary prefix or zero");
+    if (limit > 0 && limit < cfg_.vocab_size) {
+      if (tp_world != 1 || !globals_.lm_head_fp8.payload || cfg_.vocab_size % 128)
+        throw std::invalid_argument("draft shortlist requires one GPU and an aligned FP8 head");
+      draft_vocab_limit_ = static_cast<int>(limit);
+      DGPP_LOG_INFO("Qwen: experimental draft vocabulary prefix {}, target vocabulary unchanged", limit);
+    }
+  }
   // The generic session core (engine/session_model.hpp) over this family's
   // geometry: the pool's 64-token blocks, snapshots at pool boundaries,
   // the draft block's hyper-state window.
@@ -1272,7 +1284,12 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
   // ---- head: the draft distribution over the last head_rows rows --------
   const uint16_t* head_in = mtp_r_ + static_cast<size_t>(T - head_rows) * W;
   mtp_mixer_->mix(head_in, h_, head_rows, stream_);
-  lm_head_logits(h_, head_rows, stream_);
+  if (draft_vocab_limit_ > 0 && head_rows <= max_decode_rows_)
+    launch_draft_head_prefix_fp8_f32(h_, globals_.lm_head_fp8.payload, globals_.lm_head_fp8.scales,
+        logits_, head_rows, lm_vocab_count_, H, draft_vocab_limit_,
+        fp8_head_mma_ ? dense_gemv_rows() + 1 : 0, stream_);
+  else
+    lm_head_logits(h_, head_rows, stream_);
   if (decode_row) prefetch_.join(stream_);  // every forked prefetch back on the main stream
   if (decode_row && (!capture || decode_tail_mirrors_) && head_rows <= max_decode_rows_)
     DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_,

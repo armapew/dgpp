@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <type_traits>
+#include <math_constants.h>
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
@@ -464,6 +465,33 @@ void launch_scale_gemm_f32(const uint16_t* act, size_t act_row_stride_elems,
   launch_scale_gemm<float>(act, act_row_stride_elems, w_payload, w_scales,
                            out, m, n, k, stream, out_row_stride_elems, mma_from_rows, last_row_only, ws,
                            ws_bytes, compact_row);
+}
+
+namespace {
+__global__ void draft_head_excluded(float* out, int rows, int vocab, int begin, int end) {
+  const int col = begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (col < end && blockIdx.y < rows)
+    out[static_cast<size_t>(blockIdx.y) * vocab + col] = -CUDART_INF_F;
+}
+}
+
+void launch_draft_head_prefix_fp8_f32(const uint16_t* act, const uint8_t* weights,
+                                      const float* scales, float* logits, int rows,
+                                      int vocab, int hidden, int limit, int mma_from_rows,
+                                      cudaStream_t stream) {
+  if (rows < 1 || vocab < 128 || vocab % 128 || limit < 128 || limit % 128 || limit >= vocab)
+    throw std::invalid_argument("draft head: aligned vocabulary prefix required");
+  const int tail = std::max(limit, vocab - 128);
+  if (tail > limit) {
+    draft_head_excluded<<<dim3((tail - limit + 255) / 256, rows), 256, 0, stream>>>(
+        logits, rows, vocab, limit, tail);
+    DGPP_CUDA_OK(cudaGetLastError());
+  }
+  launch_scale_gemm_f32(act, hidden, weights, scales, logits, rows, limit, hidden,
+                        stream, vocab, mma_from_rows);
+  launch_scale_gemm_f32(act, hidden, weights + static_cast<size_t>(tail) * hidden,
+                        scales + static_cast<size_t>(tail / 128) * ((hidden + 127) / 128),
+                        logits + tail, rows, vocab - tail, hidden, stream, vocab, mma_from_rows);
 }
 
 namespace {
