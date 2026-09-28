@@ -529,12 +529,10 @@ __global__ __launch_bounds__(kSelectThreads) void select_partition_keys_kernel(
   auto* tile_lo = tile_hi + kSelectTile;
   for (int i = threadIdx.x; i < select_k; i += blockDim.x) best_hi[i] = best_lo[i] = 0xffffffffu;
   __syncthreads();
-  if (count > kSelectTile)
-    qsa_select_radix(keys, count, select_k, best_hi, best_lo, tile_hi, tile_lo);
-  else {
-    KeysRowFn fn{keys};
-    select_topk_stream(fn, 0, count, best_hi, best_lo, tile_hi, tile_lo, select_k);
-  }
+  // The copy path above handles count <= k. Radix is valid for every
+  // remaining partition; sorting a whole 2048-key tile for a short part
+  // costs more than the original long-row selection at the threshold.
+  qsa_select_radix(keys, count, select_k, best_hi, best_lo, tile_hi, tile_lo);
   __syncthreads();
   for (int i = threadIdx.x; i < select_k; i += blockDim.x)
     out[i] = (uint64_t(best_hi[i]) << 32) | best_lo[i];
