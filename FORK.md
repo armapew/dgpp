@@ -1,101 +1,88 @@
 # Spark maintenance fork
 
-This fork serves `nvidia/Qwen3.8-Flash-Next-NVFP4` on a headless, single-node
-NVIDIA GB10. Its workload is concurrent agentic coding and tool use with long
-contexts. Correctness and accuracy take priority over throughput.
+This fork serves `nvidia/Qwen3.8-Flash-Next-NVFP4` on one headless NVIDIA GB10.
+Its workload is concurrent agentic coding and tool use with long contexts.
+Correctness and accuracy take priority over throughput.
 
 ## Current release
 
 | Reference | Value |
 | --- | --- |
 | Maintained branch | `spark` |
-| Immutable source tag | `spark-2026.09.28.6` |
-| Tested source | `f6a0214a8484771feff0211dbfc93f295b645663` |
-| Installed release | `0.1.0+gf6a0214a8484` |
-| Imported upstream | `4564724b4c820ac8d4ee33f584c94b1855f99a53` |
-| Previous baseline | `spark-2026.09.28.5` / `0e2d46e` |
+| Immutable source tag | `spark-2026.09.28.7` |
+| Tested source | `44c5777f9e25ee7914bab3a7d902a79e445830da` |
+| Installed release | `0.1.0+g44c5777f9e25` |
+| Imported upstream | `fb4d2ad63a17db828115091a833f7fa917906ae1` |
+| Previous baseline | `spark-2026.09.28.6` / `f6a0214` |
 
 The tag fixes the tested source. Maintained `spark` adds this profile document;
 engine, launcher, tests and build files match the tag. Published tags are immutable.
 
-Upstream positional-ceiling guards reject oversized prompt/output reservations
-and pad speculative verification rows at the boundary. Our existing attention
-workspace optimization is retained alongside its upstream merge.
+Upstream now defaults `engine.prefill_group` off for cold group admission.
+Our grouped continuation/chunk path is separate and remains enabled. This does
+not establish batch invariance for the whole engine.
 
-The MTP draft head scores the first 65536 vocabulary rows and the final 128
-rows. Target generation and verification retain the full vocabulary. This saves
-draft-head work without changing target weights or cache precision, although
-proposal acceptance and the performance benefit depend on the workload.
+Prefill can yield to active generations at complete layer boundaries. It saves
+and restores the existing BF16 hyper state, preserving the 4096-token prefill
+shape and the separate decode path. The Spark profile uses
+`DGPP_PREFILL_LAYER_YIELD=8`; 0 disables it. This requires one resident GPU and
+full reservation. Cancellation retains the normal scheduler retirement boundary.
+The extra workspace is **80 MiB** at the selected shape.
 
-Bounded n-gram lookahead computes upcoming prompt hashes on one host worker and
-advises the required file pages ahead of the GPU walk. Jobs own their token
-copies; queued work is cancelled on slot reset. The existing embedding gather
-remains authoritative. No extra GPU allocation or KV format change is introduced.
+Matched temperature-zero/xhigh checks, with a cached 20K parent and a newly
+arriving 100K prompt:
 
-Focused comparisons on one GB10, with each option isolated:
-
-| Workload | Control | Selected |
+| Measurement | Yielding off | Eight-layer interval |
 | --- | --- | --- |
-| C1 decode, 20K context | 41.53 tok/s | 42.43 tok/s (+2.2%) |
-| C1 decode, 100K context | 39.18 tok/s | 40.12 tok/s (+2.4%) |
-| Cold 104K code prefill, first pair | 1801 tok/s | 1837 tok/s |
-| Cold 104K code prefill, repeat pair | 1782 tok/s | 1836 tok/s |
-| Warm repeat of the same code prefill | 1846 tok/s | 1841 tok/s |
+| Longest parent pause, 1024 generated tokens | 2.51 s | 0.54 s |
+| Completion of a 256-token parent response | 60.1 s | 45.7 s |
+| Combined runtime, 1024-token case | 78.1 s | 78.4 s |
+| New prompt's first token, 1024-token case | 54.8 s | 61.0 s |
 
-Decode values average two 512-token runs per setting; all four matched C1
-responses are identical. Cold comparisons discard only clean n-gram file-cache
-pages with the server stopped. C4 decode and warm prefill are essentially
-unchanged. These focused measurements do not establish a universal gain.
+Both responses match exactly in each comparison. Token budgets include reasoning.
+Yielding improves responsiveness under overlapping work; the new prompt waits
+longer while the existing generation makes progress. C1 has no peer to yield to.
 
-The combined release passes 24/24 concurrent 20K/100K retrieval, inspection and
-patch checks at temperature zero/xhigh, with all 16 follow-ups reusing their long
-prefix. Native checks cover selected draft logits, graph replay, cold/cached
-slot reuse and MTP 1/2/5, plus upstream HTTP and positional-boundary guards.
-Full model checks use MTP 1. A full quality suite, statistical sampled-output
-equivalence and 512K/YaRN quality are not established by these checks. Scheduling
-and execution shapes can still change floating-point results and generated text.
+Concurrent 20K/100K retrieval, inspection and patch checks pass **24/24**, with
+all 16 follow-ups reusing their long prefix. Native checks cover unchanged logits,
+graph/cache/MTP 1/2/5, stop/cancel handling and positional boundaries; CUDA
+memcheck reports zero errors. These focused checks do not replace the user's
+full benchmark suite or establish full 512K/YaRN quality. Historical reasoning
+loops remain unresolved, and scheduling can still change floating-point execution
+shapes and generated text.
 
-A CUTLASS SM121 expert prototype produced identical tested outputs, but converting
-the existing weight scales made complete operations 10–27% slower. It is excluded;
-caching converted down-projection scales alone would need about 2.4 GiB.
-
-Earlier retained work includes the original BF16 QSA indexer, prefix retention
-and system snapshots, exact n-gram staging, decode key reuse, request-bounded QSA
-storage, empty scoring-block avoidance, compact logits, NVFP4 expert reuse, dense
-conversion caching, partitioned selection, grouped prefill/draft-state fixes and
-shared-prefix coalescing. Mixed prefill/decode, grouped GDN projections, MoE
-worklists and the slower original-BF16 output head remain excluded.
+Prompt lookup, adaptive draft-chain trimming, embedding-record caching and the
+shared expert scale-layout/CUTLASS prototype are excluded. Their focused tests
+found overhead or no dependable full-model gain. The expert prototype preserved
+tested values and improved its isolated operation, but model throughput stayed
+within roughly 1% of the control. There is no new CUTLASS build dependency.
 
 ## Deployment profile
 
-Use [the Spark example](deploy/cluster_qwen-3.8-flash-next_nvfp4_w1_spark.example.json).
-Its engine fields differ from the imported upstream NVIDIA w1 example only in
-`kv_capacity: 850048`. The profile uses four slots, 262144 tokens per request
-including output, BF16 KV, MTP-1, 4096/4096 prefill budgets, a 3 GiB prefix cache,
-a 4 GiB dense-conversion cache, FP8 dense/MMA head, original BF16 indexing and
-full admission. Three independent full-context reservations fit; four do not.
+Use [the Spark example](deploy/cluster_qwen-3.8-flash-next_nvfp4_w1_spark.example.json)
+and append [the runtime options](deploy/spark-runtime.env.example) to the existing
+site `.env`. The profile retains the 850048-token BF16 KV pool, 262144 tokens per
+request including output, four slots, MTP-1, 4096/4096 prefill budgets, a 3 GiB
+prefix cache, a 4 GiB dense-conversion cache, FP8 dense/MMA head, original BF16
+indexer, draft shortlist and bounded n-gram lookahead. Three full-context
+reservations fit; four do not.
 
-Append [the runtime options](deploy/spark-runtime.env.example) to the site's
-existing `.env`. The new options are `DGPP_DRAFT_VOCAB_LIMIT=65536` and
-`DGPP_NGRAM_LOOKAHEAD_TOKENS=8192`; either can be disabled with 0 and a restart.
-The memory plan remains 110.94 GiB with the fixed 4 GiB startup guard. Lookahead
-uses bounded host metadata and the existing file cache. Dense caching preserves
-already-rounded FP8-to-BF16 values; original BF16 indexer weights are separate.
+The startup memory plan is **111.02 GiB + 4 GiB guard**. Previous accepted
+attention, logits, expert-reuse, dense-cache and shared-prefix improvements remain.
+No checkpoint, KV precision, pool capacity or sampling change is made.
 
-Pin the installed release in the deployment JSON. Keep site configuration,
-addresses, credentials and local paths outside published source. Rollback must
-restore both the previous JSON and `.env`; older parsers reject new node
-settings even when their values are zero.
+Pin the installed release. Keep site configuration and credentials outside
+published source. Rollback must restore both the previous JSON and `.env`;
+older parsers reject new node settings even when their values are zero.
 
 ## Ongoing development
 
-Start isolated `work/*` branches from `spark`. `origin` is
-[armapew/dgpp](https://github.com/armapew/dgpp); `upstream` is
-[HawkBearPig/dgpp](https://github.com/HawkBearPig/dgpp). `master` tracks the last
-imported upstream revision. Review integrations separately and retain rollback
-packages/configuration. Use non-forced pushes and keep release tags fixed.
-Publishing source does not deploy it.
+Start `work/*` branches from `spark`. `origin` is [armapew/dgpp](https://github.com/armapew/dgpp);
+`upstream` is [HawkBearPig/dgpp](https://github.com/HawkBearPig/dgpp). `master` tracks
+the last imported upstream revision. Review integrations separately, retain
+rollback packages/configuration, and use non-forced pushes. Publishing source
+and deploying it are separate operations.
 
-Evaluate long-context prefill, decode, cache reuse, concurrency and relevant MTP
-depths with fixed prompts and temperature zero/xhigh. Keep checks focused; the
-user runs broader benchmarks. Run one GPU workload at a time.
+Evaluate long-context prefill/decode, cached follow-ups, concurrency and relevant
+MTP depths with fixed prompts and temperature zero/xhigh. Keep routine checks
+focused; the user runs broader benchmarks. Run one GPU workload at a time.
