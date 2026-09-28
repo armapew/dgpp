@@ -299,6 +299,7 @@ class QwenLayerStream : public ResidentLayerStream<QwenLoaderFamily> {
   static bool dense_weights_fp8();
   // Optional checkpoint precision for the small QSA selection projection.
   static bool indexer_weights_bf16();
+  static bool target_kv_weights_bf16();
   // The RadixArk MTP expert format (engine.mtp_expert_format = "bf16_fused"):
   // fused BF16 gate_up_proj + down_proj instead of per-expert FP8 tensors.
   // Set before the stream is built; the memory plan and the resident image

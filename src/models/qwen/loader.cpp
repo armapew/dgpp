@@ -221,8 +221,13 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     const int64_t o0 = static_cast<int64_t>(geo.head_begin) * d, on = static_cast<int64_t>(geo.local_heads) * d;
     if (g_dense_weights_fp8) {
       a.q_proj_fp8 = load_bf16_rows_fp8(p + "q_proj.weight", q0, qn);
-      a.k_proj_fp8 = load_bf16_rows_fp8(p + "k_proj.weight", kv0, kvn);
-      a.v_proj_fp8 = load_bf16_rows_fp8(p + "v_proj.weight", kv0, kvn);
+      if (out.layer < cfg.num_hidden_layers && QwenLayerStream::target_kv_weights_bf16()) {
+        a.k_proj = load_bf16_rows(p + "k_proj.weight", kv0, kvn);
+        a.v_proj = load_bf16_rows(p + "v_proj.weight", kv0, kvn);
+      } else {
+        a.k_proj_fp8 = load_bf16_rows_fp8(p + "k_proj.weight", kv0, kvn);
+        a.v_proj_fp8 = load_bf16_rows_fp8(p + "v_proj.weight", kv0, kvn);
+      }
       a.o_proj_fp8 = load_bf16_cols_fp8(p + "o_proj.weight", o0, on);
     } else {
       a.q_proj = load_bf16_rows(p + "q_proj.weight", q0, qn);
@@ -762,12 +767,19 @@ bool QwenLayerStream::indexer_weights_bf16() {
   if (std::string(e) == "1") return true;
   throw std::invalid_argument("DGPP_QSA_INDEXER_BF16 must be 0 or 1");
 }
+bool QwenLayerStream::target_kv_weights_bf16() {
+  const char* e = std::getenv("DGPP_QSA_TARGET_KV_BF16");
+  if (!e || !*e || std::string(e) == "0") return false;
+  if (std::string(e) == "1") return true;
+  throw std::invalid_argument("DGPP_QSA_TARGET_KV_BF16 must be 0 or 1");
+}
 // Bit 8: the NVFP4 experts' activation scales live in the layer image (a
 // resident image written without them is rebuilt, not misread).
 uint64_t QwenLoaderFamily::loader_format() {
   // Bit 16 separates original-BF16 index projections from FP8 layer images.
   return (g_dense_weights_fp8 ? 2 : 1) | (g_mtp_experts_bf16_fused ? 4 : 0) | 8 |
-      (g_dense_weights_fp8 && QwenLayerStream::indexer_weights_bf16() ? 16 : 0);
+      (g_dense_weights_fp8 && QwenLayerStream::indexer_weights_bf16() ? 16 : 0) |
+      (g_dense_weights_fp8 && QwenLayerStream::target_kv_weights_bf16() ? 64 : 0);
 }
 
 void QwenLayerStream::set_mtp_expert_format(bool on) { g_mtp_experts_bf16_fused = on; }

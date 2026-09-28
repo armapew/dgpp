@@ -589,6 +589,61 @@ DGPP_TEST(qwen_loader_bf16_indexer_has_distinct_images_and_checkpoint_bytes) {
   fs::remove_all(cache);
 }
 
+DGPP_TEST(qwen_loader_target_bf16_kv_has_distinct_images_and_checkpoint_bytes) {
+  const Fixture fx = write_nvfp4_fixture();
+  const fs::path cache = fs::current_path() / "qwen_loader_kv_precision_cache";
+  fs::remove_all(cache);
+  const char* old = std::getenv("DGPP_QSA_TARGET_KV_BF16");
+  struct Restore {
+    bool had, fp8; std::string value, directory;
+    ~Restore() {
+      if (had) setenv("DGPP_QSA_TARGET_KV_BF16", value.c_str(), 1);
+      else unsetenv("DGPP_QSA_TARGET_KV_BF16");
+      QwenLayerStream::set_dense_weights_fp8(fp8);
+      QwenLayerStream::set_resident_image_dir(directory);
+    }
+  } restore{old != nullptr, QwenLayerStream::dense_weights_fp8(), old ? old : "",
+            QwenLayerStream::resident_image_dir()};
+  QwenLayerStream::set_resident_image_dir(cache.string());
+  QwenLayerStream::set_dense_weights_fp8(true);
+  int qsa = 0;
+  while (fx.cfg.layers.at(qsa) != dgpp::QwenLayerKind::Qsa) ++qsa;
+  uint64_t formats[2]{};
+  size_t sizes[2]{};
+  for (int pass = 0; pass < 4; ++pass) {
+    const bool full = pass % 2 != 0;
+    setenv("DGPP_QSA_TARGET_KV_BF16", full ? "1" : "0", 1);
+    formats[full] = dgpp::QwenLoaderFamily::loader_format();
+    QwenLayerStream stream(fx.cfg, fx.dir, 0, 1, dgpp::QwenResidency::Resident);
+    int loaded = 0;
+    for (const int layer : {qsa, fx.cfg.mtp_layer()}) {
+      if (layer < 0) continue;
+      const auto& r = stream.load_layer(layer);
+      const std::string prefix = dgpp::qwen_layer_prefix(fx.cfg, layer) + "self_attn.";
+      require(!r.qsa.q_proj && r.qsa.q_proj_fp8.payload && !r.qsa.o_proj && r.qsa.o_proj_fp8.payload,
+              "Q/O projections remain FP8");
+      if (full && layer == qsa) {
+        require(r.qsa.k_proj && r.qsa.v_proj && !r.qsa.k_proj_fp8.payload && !r.qsa.v_proj_fp8.payload,
+                "target K/V use checkpoint BF16 only");
+        expect_device_equals(r.qsa.k_proj, fx.bytes(prefix + "k_proj.weight"), "checkpoint K weights");
+        expect_device_equals(r.qsa.v_proj, fx.bytes(prefix + "v_proj.weight"), "checkpoint V weights");
+      } else {
+        require(!r.qsa.k_proj && !r.qsa.v_proj && r.qsa.k_proj_fp8.payload && r.qsa.v_proj_fp8.payload,
+                "control and MTP K/V remain FP8");
+      }
+      require(r.bytes == QwenLayerStream::layer_bytes(fx.cfg, layer, 0, 1),
+              "mixed-precision memory plan matches actual layer size");
+      if (layer == qsa) sizes[full] = r.bytes;
+      ++loaded;
+    }
+    require((pass < 2 ? stream.image_layers_captured() : stream.image_layers_restored()) == loaded,
+            "precision modes must capture separately then restore their own images");
+  }
+  require(formats[0] != formats[1], "target KV precision must separate resident images");
+  require(sizes[1] > sizes[0], "BF16 K/V weights add accounted memory");
+  fs::remove_all(cache);
+}
+
 DGPP_TEST(qwen_loader_resident_mode_and_image_round_trip) {
   const Fixture fx = write_fixture();
   const fs::path cache = fs::current_path() / "qwen_loader_image_cache";
