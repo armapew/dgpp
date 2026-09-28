@@ -121,6 +121,14 @@ void qsa_select_from_keys(const uint64_t* keys_ws, int64_t ws_stride, const int6
                           int rows, int select_k, int kpool, int max_selected,
                           int32_t* topk_out, int32_t* out_counts, cudaStream_t stream);
 
+// Exact top-k through per-partition top-k lists, then an exact merge.
+// partials holds rows * partitions * select_k uint64 keys, separate from
+// the input keys. Rows below min_pools keep the original single-block path.
+void qsa_select_from_keys_partitioned(const uint64_t* keys_ws, int64_t ws_stride,
+    const int64_t* pos, int rows, int select_k, int kpool, int max_selected,
+    int32_t* topk_out, int32_t* out_counts, uint64_t* partials, int partitions,
+    int64_t min_pools, cudaStream_t stream);
+
 // Listed GQA attention partials: one block per (row, split, head group of
 // hpb heads sharing a kv head); q bf16 rows of local_heads x dim (row
 // stride q_row_stride, heads contiguous); caches as qsa_kv_append writes

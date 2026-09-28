@@ -516,6 +516,10 @@ QwenQsaLayer::QwenQsaLayer(const QwenQsaResident& w, const QwenGemmWorkspace& ge
   if (const char* tile = std::getenv("DGPP_QSA_QUERY_TILE")) query_tile_ = std::atoi(tile);
   if (query_tile_ != 1 && query_tile_ != 2 && query_tile_ != 4 && query_tile_ != 8)
     throw std::invalid_argument("QwenQsaLayer: DGPP_QSA_QUERY_TILE must be 1, 2, 4 or 8");
+  if (const char* parts = std::getenv("DGPP_QSA_DECODE_PARTS")) decode_partitions_ = std::atoi(parts);
+  if (decode_partitions_ != 1 && decode_partitions_ != 2 && decode_partitions_ != 4 &&
+      decode_partitions_ != 8 && decode_partitions_ != 16)
+    throw std::invalid_argument("QwenQsaLayer: DGPP_QSA_DECODE_PARTS must be 1, 2, 4, 8 or 16");
   scale_ = static_cast<float>(std::pow(static_cast<double>(dim_), -0.5));
   std::vector<float> inv(static_cast<size_t>(rotary_ / 2));
   // The rope table: the plain one, or the YaRN ramp the engine knob asks
@@ -653,8 +657,18 @@ void QwenQsaLayer::enqueue(const uint16_t* x, int tokens, const QwenQsaRows& row
                   cache.blocks_per_request, cache.index_cache, pools_per_block, idx_heads_, Di, kpool_,
                   keys_ws_, max_pools_, stream,
                   rows.decode ? -1 : (rows.pos0 + T) / kpool_, rows.decode ? 1 : query_tile_);
-  qsa_select_from_keys(keys_ws_, max_pools_, d_pos, T, select_k_, kpool_, max_selected_, topk_,
-                       counts_, stream);
+  const int64_t partial_keys = int64_t(T) * decode_partitions_ * select_k_;
+  if (rows.decode && decode_partitions_ > 1 &&
+      partial_keys <= int64_t(max_tokens_ - T) * max_pools_) {
+    // Decode uses only the leading T score rows. Borrow the unused prefill
+    // rows for exact partition results; no additional model allocation.
+    qsa_select_from_keys_partitioned(keys_ws_, max_pools_, d_pos, T, select_k_, kpool_,
+        max_selected_, topk_, counts_, keys_ws_ + int64_t(T) * max_pools_,
+        decode_partitions_, 16384, stream);
+  } else {
+    qsa_select_from_keys(keys_ws_, max_pools_, d_pos, T, select_k_, kpool_, max_selected_, topk_,
+                         counts_, stream);
+  }
   // Small grids do not amortize the wider head group. Keep decode/verify and
   // short prefills on their existing kernel; both paths use identical arithmetic.
   // Long prefill walks take the one-warp tensor-core kernel

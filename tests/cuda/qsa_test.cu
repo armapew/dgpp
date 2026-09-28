@@ -572,6 +572,64 @@ DGPP_TEST(qsa_request_bounded_workspace_preserves_scores_selection_and_graphs) {
   }
 }
 
+DGPP_TEST(qsa_partitioned_selection_is_exact_with_ties_tails_and_graph_replay) {
+  constexpr int rows = 24, stride = 131072, guard = 16, kpool = 4;
+  const auto stream = test_stream();
+  std::mt19937 rng(918237);
+  std::vector<uint64_t> keys(size_t(rows) * stride);
+  const std::vector<int64_t> cases{-1, 0, 2, 3, 20000, 65531, 65535, 65536,
+                                    100003, 200001, 262143, 524287};
+  std::vector<int64_t> positions(rows);
+  DevBuf dp(rows * sizeof(int64_t));
+  for (int pattern = 0; pattern < 4; ++pattern) {
+    for (int row = 0; row < rows; ++row) for (int p = 0; p < stride; ++p) {
+      const uint32_t score = pattern == 0 ? rng() : pattern == 1 ? 42 :
+                             pattern == 2 ? rng() % 8 : uint32_t(stride - p);
+      keys[size_t(row) * stride + p] = (uint64_t(score) << 21) | uint64_t(p);
+    }
+    auto dk = up(keys);
+    for (int select_k : {8, 512, 1024}) for (int parts : {2, 4, 8, 16}) {
+      const int width = select_k * kpool + kpool - 1;
+      const size_t partial_size = size_t(rows) * parts * select_k;
+      DevBuf partials((partial_size + 2 * guard) * sizeof(uint64_t));
+      DevBuf a(size_t(rows) * width * sizeof(int32_t)), b(a.bytes);
+      DevBuf ca(rows * sizeof(int32_t)), cb(ca.bytes);
+      DGPP_CUDA_OK(cudaMemsetAsync(partials.p, 0xa5, partials.bytes, stream));
+      const auto launch = [&] {
+        dgpp::qsa_select_from_keys_partitioned(ptr<uint64_t>(dk), stride, ptr<int64_t>(dp), rows,
+            select_k, kpool, width, mptr<int32_t>(b), mptr<int32_t>(cb),
+            mptr<uint64_t>(partials) + guard, parts, 16384, stream);
+      };
+      cudaGraph_t graph = nullptr;
+      cudaGraphExec_t executable = nullptr;
+      DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+      launch();
+      DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+      DGPP_CUDA_OK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+      for (int replay = 0; replay < 3; ++replay) {
+        for (int r = 0; r < rows; ++r) positions[r] = cases[(r + 5 * replay) % cases.size()];
+        dp.upload(positions.data(), positions.size() * sizeof(int64_t));
+        dgpp::qsa_select_from_keys(ptr<uint64_t>(dk), stride, ptr<int64_t>(dp), rows,
+            select_k, kpool, width, mptr<int32_t>(a), mptr<int32_t>(ca), stream);
+        if (replay == 0) launch();
+        else DGPP_CUDA_OK(cudaGraphLaunch(executable, stream));
+        DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+        require(down<int32_t>(a, size_t(rows) * width) == down<int32_t>(b, size_t(rows) * width),
+                "partitioned selection changes a selected token or padding");
+        require(down<int32_t>(ca, rows) == down<int32_t>(cb, rows), "partitioned selection changes counts");
+      }
+      const auto scratch = down<uint64_t>(partials, partial_size + 2 * guard);
+      for (int i = 0; i < guard; ++i)
+        require(scratch[i] == 0xa5a5a5a5a5a5a5a5ULL &&
+                    scratch[guard + partial_size + i] == 0xa5a5a5a5a5a5a5a5ULL,
+                "partitioned selection overwrites scratch guards");
+      DGPP_CUDA_OK(cudaGraphExecDestroy(executable));
+      DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    }
+  }
+  std::printf("[ OK ] partitioned selection: random/tied keys, padding/tails, 8/512/1024 top-k, dynamic graphs\n");
+}
+
 DGPP_TEST(qsa_query_tiles_preserve_keys_selections_and_graph_replay) {
   constexpr int dim = 128, ppb = 16, kpool = 4, select_k = 512;
   constexpr int requests = 3, guard = 16, width = select_k * kpool + kpool - 1;

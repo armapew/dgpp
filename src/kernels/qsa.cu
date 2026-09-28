@@ -507,10 +507,45 @@ __device__ inline void qsa_select_radix(const uint64_t* keys, int64_t visible, i
   __syncthreads();
 }
 
+__global__ __launch_bounds__(kSelectThreads) void select_partition_keys_kernel(
+    const uint64_t* __restrict__ keys_ws, int64_t ws_stride, const int64_t* __restrict__ pos,
+    int select_k, int kpool, int partitions, int64_t min_pools, uint64_t* __restrict__ partials) {
+  const int64_t row = blockIdx.x, part = blockIdx.y;
+  const int64_t visible = (pos[row] + 1) / kpool;
+  if (pos[row] < 0 || visible < min_pools) return;
+  const int64_t span = (visible + partitions - 1) / partitions;
+  const int64_t begin = min(part * span, visible), count = max(int64_t{0}, min(span, visible - begin));
+  auto* out = partials + (row * partitions + part) * select_k;
+  const auto* keys = keys_ws + row * ws_stride + begin;
+  if (count <= select_k) {
+    for (int i = threadIdx.x; i < select_k; i += blockDim.x)
+      out[i] = i < count ? keys[i] : UINT64_MAX;
+    return;
+  }
+  extern __shared__ uint64_t smem_u64[];
+  auto* best_hi = reinterpret_cast<uint32_t*>(smem_u64);
+  auto* best_lo = best_hi + select_k;
+  auto* tile_hi = best_lo + select_k;
+  auto* tile_lo = tile_hi + kSelectTile;
+  for (int i = threadIdx.x; i < select_k; i += blockDim.x) best_hi[i] = best_lo[i] = 0xffffffffu;
+  __syncthreads();
+  if (count > kSelectTile)
+    qsa_select_radix(keys, count, select_k, best_hi, best_lo, tile_hi, tile_lo);
+  else {
+    KeysRowFn fn{keys};
+    select_topk_stream(fn, 0, count, best_hi, best_lo, tile_hi, tile_lo, select_k);
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < select_k; i += blockDim.x)
+    out[i] = (uint64_t(best_hi[i]) << 32) | best_lo[i];
+}
+
+template <bool UsePartitions>
 __global__ __launch_bounds__(kSelectThreads) void select_from_keys_kernel(
     const uint64_t* __restrict__ keys_ws, int64_t ws_stride, const int64_t* __restrict__ pos,
     int select_k, int kpool, int max_selected, int32_t* __restrict__ topk_out,
-    int32_t* __restrict__ out_counts) {
+    int32_t* __restrict__ out_counts, const uint64_t* __restrict__ partials,
+    int partitions, int64_t min_pools) {
   extern __shared__ uint64_t smem_u64[];
   uint32_t* best_hi = reinterpret_cast<uint32_t*>(smem_u64);
   uint32_t* best_lo = best_hi + select_k;
@@ -526,17 +561,20 @@ __global__ __launch_bounds__(kSelectThreads) void select_from_keys_kernel(
     if (threadIdx.x == 0) out_counts[r] = 0;
     return;
   }
-  const int64_t visible = (p + 1) / kpool;
+  const int64_t original_visible = (p + 1) / kpool;
+  const bool partitioned = UsePartitions && original_visible >= min_pools;
+  const int64_t visible = partitioned ? int64_t(partitions) * select_k : original_visible;
+  const uint64_t* input = partitioned ? partials + r * partitions * select_k : keys_ws + r * ws_stride;
   for (int i = threadIdx.x; i < select_k; i += blockDim.x) {
     best_hi[i] = 0xFFFFFFFFu;
     best_lo[i] = 0xFFFFFFFFu;
   }
   __syncthreads();
   if (visible > kSelectTile)
-    qsa_select_radix(keys_ws + r * ws_stride, visible, select_k, best_hi, best_lo, tile_hi,
+    qsa_select_radix(input, visible, select_k, best_hi, best_lo, tile_hi,
                      tile_lo);
   else {
-    KeysRowFn fn{keys_ws + r * ws_stride};
+    KeysRowFn fn{input};
     select_topk_stream(fn, 0, visible, best_hi, best_lo, tile_hi, tile_lo, select_k);
   }
   __syncthreads();
@@ -826,8 +864,28 @@ void qsa_select_from_keys(const uint64_t* keys_ws, int64_t ws_stride, const int6
     throw std::invalid_argument("qsa_select_from_keys: max_selected too small for the budget + tail");
   const size_t smem = static_cast<size_t>(select_k) * 8 + static_cast<size_t>(kSelectTile) * 8 +
                       static_cast<size_t>(select_k + 1) * 4 + 8;
-  select_from_keys_kernel<<<static_cast<unsigned>(rows), kSelectThreads, smem, stream>>>(
-      keys_ws, ws_stride, pos, select_k, kpool, max_selected, topk_out, out_counts);
+  select_from_keys_kernel<false><<<static_cast<unsigned>(rows), kSelectThreads, smem, stream>>>(
+      keys_ws, ws_stride, pos, select_k, kpool, max_selected, topk_out, out_counts, nullptr, 0, 0);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void qsa_select_from_keys_partitioned(const uint64_t* keys_ws, int64_t ws_stride,
+    const int64_t* pos, int rows, int select_k, int kpool, int max_selected,
+    int32_t* topk_out, int32_t* out_counts, uint64_t* partials, int partitions,
+    int64_t min_pools, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (!keys_ws || !pos || !topk_out || !out_counts || !partials || kpool <= 0 ||
+      (partitions != 2 && partitions != 4 && partitions != 8 && partitions != 16) ||
+      select_k <= 0 || select_k > 1024 || min_pools < select_k ||
+      max_selected < select_k * kpool + kpool - 1)
+    throw std::invalid_argument("qsa_select_from_keys_partitioned: invalid shape or buffer");
+  const size_t smem = static_cast<size_t>(select_k) * 8 + static_cast<size_t>(kSelectTile) * 8 +
+                      static_cast<size_t>(select_k + 1) * 4 + 8;
+  select_partition_keys_kernel<<<dim3(rows, partitions), kSelectThreads, smem, stream>>>(
+      keys_ws, ws_stride, pos, select_k, kpool, partitions, min_pools, partials);
+  select_from_keys_kernel<true><<<static_cast<unsigned>(rows), kSelectThreads, smem, stream>>>(
+      keys_ws, ws_stride, pos, select_k, kpool, max_selected, topk_out, out_counts,
+      partials, partitions, min_pools);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
