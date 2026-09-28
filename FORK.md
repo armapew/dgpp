@@ -4,64 +4,67 @@ This fork serves `nvidia/Qwen3.8-Flash-Next-NVFP4` on a headless, single-node
 NVIDIA GB10. Its workload is concurrent agentic coding and tool use with long
 contexts. Correctness and accuracy take priority over throughput.
 
-## Accepted baseline
+## Current release
 
 | Reference | Value |
 | --- | --- |
 | Maintained branch | `spark` |
-| Immutable source tag | `spark-2026.09.28.5` |
-| Tested source | `0e2d46ed9dcd14bde6f77a1356fc23fe8a6fc313` |
-| Installed release | `0.1.0+g0e2d46ed9dcd` |
-| Imported upstream | `d027073e66f44f43e9c1580e14d9de4a43e13446` |
-| Previous baseline | `spark-2026.09.28.4` / `2d7b0fc` |
+| Immutable source tag | `spark-2026.09.28.6` |
+| Tested source | `f6a0214a8484771feff0211dbfc93f295b645663` |
+| Installed release | `0.1.0+gf6a0214a8484` |
+| Imported upstream | `4564724b4c820ac8d4ee33f584c94b1855f99a53` |
+| Previous baseline | `spark-2026.09.28.5` / `0e2d46e` |
 
 The tag fixes the tested source. Maintained `spark` adds this profile document;
 engine, launcher, tests and build files match the tag. Published tags are immutable.
 
-The latest changes protect useful prefix snapshots, reduce n-gram table I/O,
-and reuse index-key loads during decode. Upstream's 1024-token snapshot floor
-and system-prompt snapshots are integrated with grouped prefill and cold-prefix
-coalescing, including head-snapshot cleanup and waiting dependencies.
+Upstream positional-ceiling guards reject oversized prompt/output reservations
+and pad speculative verification rows at the boundary. Our existing attention
+workspace optimization is retained alongside its upstream merge.
 
-N-gram staging advises only the pages containing requested records, combines
-repeated/adjacent page requests, and reuses copy workers for large chunks. Tiny
-gathers remain allocation-free. Embedding bytes and their conversion are unchanged.
-Decode query tile 2 preserves the score arithmetic and selections; its small
-unbounded-position launch uses 128-pool stripes to retain sufficient parallelism.
+The MTP draft head scores the first 65536 vocabulary rows and the final 128
+rows. Target generation and verification retain the full vocabulary. This saves
+draft-head work without changing target weights or cache precision, although
+proposal acceptance and the performance benefit depend on the workload.
 
-Focused measurements on one GB10:
+Bounded n-gram lookahead computes upcoming prompt hashes on one host worker and
+advises the required file pages ahead of the GPU walk. Jobs own their token
+copies; queued work is cancelled on slot reset. The existing embedding gather
+remains authoritative. No extra GPU allocation or KV format change is introduced.
+
+Focused comparisons on one GB10, with each option isolated:
 
 | Workload | Control | Selected |
 | --- | --- | --- |
-| 20K follow-up after 32 short requests, first token | 9.87 s | 0.27 s |
-| New conversation with the same 20K system prompt, first token | 9.82 s | 0.22 s |
-| 101K source-code prefill, first pass with table pages cold | 57.26 s | 56.41 s |
-| Same source-code prefill, repeated | 56.83 s | 54.79 s |
-| Table reads, first pass / repeat | 3.81 / 3.57 GiB | 1.95 / 0 GiB |
+| C1 decode, 20K context | 41.53 tok/s | 42.43 tok/s (+2.2%) |
+| C1 decode, 100K context | 39.18 tok/s | 40.12 tok/s (+2.4%) |
+| Cold 104K code prefill, first pair | 1801 tok/s | 1837 tok/s |
+| Cold 104K code prefill, repeat pair | 1782 tok/s | 1836 tok/s |
+| Warm repeat of the same code prefill | 1846 tok/s | 1841 tok/s |
 
-The staging comparison uses identical code and explicitly discards clean table
-file-cache pages before each arm. Already-warm small working sets show essentially
-unchanged prefill speed. The separate decode-key comparison gives C1 averages of
-41.39 → 41.78 tokens/s at 20K and 39.12 → 39.34 at 100K, with matching responses.
-Those are small screening differences; C2/C4 results are inconclusive and do not
-establish a general throughput gain.
+Decode values average two 512-token runs per setting; all four matched C1
+responses are identical. Cold comparisons discard only clean n-gram file-cache
+pages with the server stopped. C4 decode and warm prefill are essentially
+unchanged. These focused measurements do not establish a universal gain.
 
-Concurrent 20K/100K retrieval, inspection and patch checks pass 24/24 at
-temperature zero/xhigh; all 16 follow-ups reuse their long prefix. Native checks
-cover exact n-gram bytes, concurrent gathers, QSA keys/selections/graph replay,
-and identical resident/staged cache transcripts at MTP 1/2/5. Full model serving
-checks use MTP 1. A full quality suite and 512K/YaRN quality are not established
-by these checks. Scheduling and prefill boundaries can still change floating-point
-execution and generated text.
+The combined release passes 24/24 concurrent 20K/100K retrieval, inspection and
+patch checks at temperature zero/xhigh, with all 16 follow-ups reusing their long
+prefix. Native checks cover selected draft logits, graph replay, cold/cached
+slot reuse and MTP 1/2/5, plus upstream HTTP and positional-boundary guards.
+Full model checks use MTP 1. A full quality suite, statistical sampled-output
+equivalence and 512K/YaRN quality are not established by these checks. Scheduling
+and execution shapes can still change floating-point results and generated text.
 
-The original BF16 QSA indexer is retained. The separate original-BF16 output-head
-experiment is excluded: C1 decode fell about 11–13%, beyond the intended small
-speed trade-off, without an established task-accuracy gain. The output head stays FP8.
+A CUTLASS SM121 expert prototype produced identical tested outputs, but converting
+the existing weight scales made complete operations 10–27% slower. It is excluded;
+caching converted down-projection scales alone would need about 2.4 GiB.
 
-Earlier retained work includes request-bounded QSA storage, empty scoring-block
-avoidance, compact logits, NVFP4 expert reuse, exact dense-conversion caching,
-partitioned selection, grouped prefill and draft-state fixes, and shared-prefix
-coalescing. Mixed prefill/decode, grouped GDN projections and MoE worklists remain excluded.
+Earlier retained work includes the original BF16 QSA indexer, prefix retention
+and system snapshots, exact n-gram staging, decode key reuse, request-bounded QSA
+storage, empty scoring-block avoidance, compact logits, NVFP4 expert reuse, dense
+conversion caching, partitioned selection, grouped prefill/draft-state fixes and
+shared-prefix coalescing. Mixed prefill/decode, grouped GDN projections, MoE
+worklists and the slower original-BF16 output head remain excluded.
 
 ## Deployment profile
 
@@ -73,11 +76,11 @@ a 4 GiB dense-conversion cache, FP8 dense/MMA head, original BF16 indexing and
 full admission. Three independent full-context reservations fit; four do not.
 
 Append [the runtime options](deploy/spark-runtime.env.example) to the site's
-existing `.env`. The new options are `DGPP_NGRAM_STAGING=1` and
-`DGPP_QSA_DECODE_QUERY_TILE=2`; use 0 and 1 respectively for comparisons.
-The memory plan remains 110.94 GiB with the fixed 4 GiB startup guard. Dense
-caching preserves already-rounded FP8-to-BF16 values; it does not recover
-checkpoint precision. Original BF16 indexer weights are loaded separately.
+existing `.env`. The new options are `DGPP_DRAFT_VOCAB_LIMIT=65536` and
+`DGPP_NGRAM_LOOKAHEAD_TOKENS=8192`; either can be disabled with 0 and a restart.
+The memory plan remains 110.94 GiB with the fixed 4 GiB startup guard. Lookahead
+uses bounded host metadata and the existing file cache. Dense caching preserves
+already-rounded FP8-to-BF16 values; original BF16 indexer weights are separate.
 
 Pin the installed release in the deployment JSON. Keep site configuration,
 addresses, credentials and local paths outside published source. Rollback must
