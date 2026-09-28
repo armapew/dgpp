@@ -203,6 +203,10 @@ class QwenModel : public SessionModel<QwenModel> {
   bool session_prefill_advance(PrefillCursor& cursor, int64_t chunk_tokens = 0);
   std::vector<bool> session_prefill_advance_group(const std::vector<PrefillCursor*>& cursors,
                                                 int64_t chunk_tokens);
+  // Diagnostic prototype: one target-decode row plus one prefill chunk.
+  // It is deliberately unavailable to the serving adapter or MTP sessions.
+  Outputs session_mixed_step_prefill(int decode_req, int64_t token, PrefillCursor& prefill,
+                                     int64_t chunk_tokens);
   void graph_prepare();
   void mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, int T, bool decode_row,
                     bool capture, int head_rows, int batch_requests, int prefill_row_offset = 0);

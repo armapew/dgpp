@@ -139,6 +139,7 @@ class SessionModel : public PrefillReporting {
     const int64_t* span_pos0 = nullptr;
     const int32_t* span_lens = nullptr;
     int num_spans = 0;
+    int mixed_decode_rows = 0;  // diagnostic Qwen mixed-walk prototype only
   };
   // The staged inputs of a walk (begin_run).
   struct RowInputs {

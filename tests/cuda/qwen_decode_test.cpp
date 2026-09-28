@@ -15,6 +15,8 @@
 // cuts) agrees with the one-shot; a closed and reopened slot restarts
 // bitwise; the pool's block accounting.
 #include <algorithm>
+#include <chrono>
+#include <fstream>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -151,6 +153,67 @@ int audit(QwenModel& ref, const std::vector<int64_t>& prompt, const Transcript& 
 
 // The prefill head must match the diagnostic full head across the GEMV/dense
 // transition. A one-row GEMV substitution fails this gate for long prompts.
+int run_mixed_bench(const std::string& dir, int context, const std::string& ids_file) {
+  const auto cfg = QwenTextConfig::from_json_file((fs::path(dir) / "config.json").string());
+  dgpp::QwenLayerStream::set_dense_weights_fp8(true);
+  dgpp::QwenLayerStream::set_ngram_table_mmap(true);
+  QwenModel model(cfg, dir, 4096, 2 * (context + 4096), QwenResidency::Resident, nullptr,
+                  0, 1, 2, false, 8, true, true);
+  std::vector<int64_t> corpus;
+  if (!ids_file.empty()) {
+    std::ifstream f(ids_file);
+    int64_t id;
+    while (f >> id) corpus.push_back(id);
+    require(corpus.size() >= static_cast<size_t>(context + 2048), "mixed benchmark token file is too short");
+  } else corpus = smoke_tokens(cfg, context + 2048, 0x17a33);
+  const std::vector<int64_t> prefix(corpus.begin(), corpus.begin() + context);
+  const auto initial = model.session_prefill(0, prefix);
+  const int V = model.lm_vocab_count();
+  const int64_t token = argmax(initial.logits.data(), V);
+  uint8_t* arena = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&arena, model.session_snapshot_bytes()));
+  auto meta = model.session_snapshot(0, arena);
+  model.session_close(0);
+  bool numerical_gate = true;
+  for (const int chunk : {128, 512, 1024, 2048}) {
+    if (context % chunk) continue;
+    const std::vector<int64_t> prompt(corpus.begin(), corpus.begin() + context + chunk);
+    QwenModel::Outputs ref_decode, ref_prefill;
+    for (int pair = 0; pair < 4; ++pair) for (int arm = 0; arm < 2; ++arm) {
+      const bool mixed = pair % 2 ? arm == 0 : arm == 1;
+      model.session_attach(0, arena, meta);
+      model.session_attach(1, arena, meta);
+      auto cursor = model.session_prefill_begin(1, prompt, context + chunk, chunk, {}, nullptr, context);
+      model.session_reserve_blocks(0, context + 1);
+      const auto start = std::chrono::steady_clock::now();
+      QwenModel::Outputs decoded;
+      if (mixed) decoded = model.session_mixed_step_prefill(0, token, cursor, chunk);
+      else {
+        model.session_prefill_advance(cursor, chunk);
+        decoded = model.session_step(0, token);
+      }
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      require(cursor.next == cursor.end && model.session_position(0) == context + 1,
+              "mixed benchmark must compute the same complete chunk and decode row");
+      if (!mixed) { ref_decode = decoded; ref_prefill = cursor.output; }
+      const auto dc = compare_row(decoded.logits.data(), ref_decode.logits.data(), V);
+      const auto pc = compare_row(cursor.output.logits.data(), ref_prefill.logits.data(), V);
+      numerical_gate &= dc.l2 < 0.02 && (dc.top1_equal || dc.near_tie) && pc.l2 < 0.02;
+      std::printf("{\"context\":%d,\"chunk\":%d,\"pair\":%d,\"mixed\":%s,\"wall_ms\":%.6f,"
+                  "\"decode_l2\":%.8g,\"prefill_l2\":%.8g,\"decode_top1_equal\":%s}\n",
+                  context, chunk, pair, mixed ? "true" : "false", ms, dc.l2, pc.l2,
+                  dc.top1_equal ? "true" : "false");
+      std::fflush(stdout);
+      model.session_close(0); model.session_close(1);
+    }
+  }
+  model.session_release_snapshot(meta);
+  DGPP_CUDA_OK(cudaFree(arena));
+  require(model.kv_blocks_in_use() == 0, "mixed diagnostic releases cache blocks");
+  require(numerical_gate, "mixed decode exceeds the existing teacher-forced numerical budget");
+  return 0;
+}
+
 int run_grouped_chunks(const std::string& dir) {
   const auto cfg = QwenTextConfig::from_json_file((fs::path(dir) / "config.json").string());
   QwenModel solo(cfg, dir, 128, 2048, QwenResidency::Resident, nullptr, 0, 1, 4, true, 24);
@@ -1125,6 +1188,9 @@ int main(int argc, char** argv) {
   std::string fixture, checkpoint, ids_text;
   bool fp8_head = false, prefill_head = false, dense_cache = false, grouped_mtp = false;
   bool grouped_chunks = false;
+  bool mixed_bench = false;
+  int mixed_context = 1024;
+  std::string mixed_ids;
   int steps = 4;
   int layers_extra = -1;
   for (int i = 1; i < argc; ++i) {
@@ -1140,12 +1206,16 @@ int main(int argc, char** argv) {
       grouped_mtp = true;
     else if (a == "--grouped-chunks")
       grouped_chunks = true;
+    else if (a == "--mixed-bench") mixed_bench = true;
+    else if (a == "--mixed-context" && i + 1 < argc) mixed_context = std::stoi(argv[++i]);
+    else if (a == "--mixed-ids" && i + 1 < argc) mixed_ids = argv[++i];
     else if (a == "--checkpoint-dir" && i + 1 < argc) checkpoint = argv[++i];
     else if (a == "--ids" && i + 1 < argc) ids_text = argv[++i];
     else if (a == "--steps" && i + 1 < argc) steps = std::stoi(argv[++i]);
     else if (a == "--layers" && i + 1 < argc) layers_extra = std::stoi(argv[++i]);
   }
   try {
+    if (mixed_bench) return run_mixed_bench(fixture.empty() ? checkpoint : fixture, mixed_context, mixed_ids);
     if (!fixture.empty() && grouped_chunks) return run_grouped_chunks(fixture);
     if (!fixture.empty() && grouped_mtp) return run_grouped_mtp(fixture);
     if (!fixture.empty()) return dense_cache ? run_dense_cache(fixture) :
