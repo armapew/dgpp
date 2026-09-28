@@ -402,17 +402,22 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
         sizeof(uint16_t) * dgpp::kPickScratchElems(1), cudaHostAllocDefault));
     {
       GraphEngineAdapter<QwenModel> graph(&model, buses[0].get(), 0, 1, scratch,
-          cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 0, nullptr, 4, depth, false);
+          cfg.vocab_size, wait_timeout_ms(), 2, nullptr, nullptr, 0, nullptr, 8, depth, false);
       require(graph.supports_grouped_prefill_advance(), "grouped engine capability");
-      const std::vector<int64_t> cuts{64};
+      const std::vector<int64_t> cuts{32, 64};
       for (int round = 0; round < 2; ++round) {
         std::vector<int> pending{0, 1, 2, 3}, active;
         std::vector<int> counts(4);
         for (int req : pending) {
           dgpp::sched::SchedulerEngine::PrefixPrefill plan;
           plan.boundaries = &cuts;
-          if (round == 0) { plan.snap_slot = req; plan.snap_position = 64; }
-          else { plan.attach_slot = req; plan.attach_position = 64; }
+          if (round == 0) {
+            plan.snap_slot = req; plan.snap_position = 64;
+            plan.head_snap_slot = req + 4; plan.head_snap_position = 32;
+          } else {
+            plan.attach_slot = req + (req % 2 ? 4 : 0);
+            plan.attach_position = req % 2 ? 32 : 64;
+          }
           graph.begin_prefill(req, prompts[req], 256, 32, plan);
         }
         int ticks = 0;
@@ -426,6 +431,7 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
                       "grouped continuation chunk bound");
               if (progress[i].first_token >= 0) {
                 require(round != 0 || progress[i].snap_taken, "each grouped snapshot is committed");
+                require(round != 0 || progress[i].head_snap_taken, "each grouped head snapshot is committed");
                 counts[req] = 1;
                 active.push_back(req);
                 graph.reserve(req, 256);
@@ -449,7 +455,7 @@ DGPP_TEST(qwen_grouped_continuations_keep_cache_and_mtp_slots_independent) {
         require(pending.empty() && active.empty(), "grouped cache lifecycle completes");
         for (int req = 0; req < 4; ++req) require(counts[req] >= 16, "every grouped request completed");
       }
-      for (int req = 0; req < 4; ++req) graph.prefix_release(req);
+      for (int req = 0; req < 8; ++req) graph.prefix_release(req);
       graph.drain();
       require(graph.pool_blocks_in_use() == 0, "grouped cache lifecycle releases all blocks");
     }
