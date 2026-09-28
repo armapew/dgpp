@@ -636,7 +636,7 @@ DGPP_TEST(qsa_query_tiles_preserve_keys_selections_and_graph_replay) {
   constexpr int qstride = 4 * dim + 8;
   cudaStream_t stream = test_stream();
   for (int context : {2053, 100003, 200003, 524287}) {
-    const int rows = context == 2053 ? 4099 : 19;
+    for (int rows : {2, 4, 8, context == 2053 ? 4099 : 19}) {
     const int visible_max = context / kpool;
     const int stride = visible_max + 7;
     const int blocks = (stride + ppb - 1) / ppb;
@@ -708,6 +708,7 @@ DGPP_TEST(qsa_query_tiles_preserve_keys_selections_and_graph_replay) {
     }
     std::printf("[ .. ] query tiles 2/4/8, %d rows at context %d: scores, selections and graphs exact\n",
                 rows, context);
+    }
   }
 }
 
