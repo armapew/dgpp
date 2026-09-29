@@ -9,53 +9,35 @@ Correctness and accuracy take priority over throughput.
 | Reference | Value |
 | --- | --- |
 | Maintained branch | `spark` |
-| Immutable source tag | `spark-2026.09.28.7` |
-| Tested source | `44c5777f9e25ee7914bab3a7d902a79e445830da` |
-| Installed release | `0.1.0+g44c5777f9e25` |
-| Imported upstream | `fb4d2ad63a17db828115091a833f7fa917906ae1` |
-| Previous baseline | `spark-2026.09.28.6` / `f6a0214` |
+| Immutable source tag | `spark-2026.09.29.1` |
+| Tested source | `620506561ee87155ac00fc0c8e575e70a915c907` |
+| Installed release | `0.1.0+g620506561ee8` |
+| Imported upstream | `84028a497443782d9f3dde08895c638658115933` |
+| Previous baseline | `spark-2026.09.28.7` / `44c5777` |
 
 The tag fixes the tested source. Maintained `spark` adds this profile document;
 engine, launcher, tests and build files match the tag. Published tags are immutable.
 
-Upstream now defaults `engine.prefill_group` off for cold group admission.
-Our grouped continuation/chunk path is separate and remains enabled. This does
-not establish batch invariance for the whole engine.
+The profile now keeps target-model attention K/V projections in original
+checkpoint BF16. `DGPP_QSA_TARGET_KV_BF16=1` enables it; 0 restores their FP8
+conversion on restart. Q/O, output-head and draft precision stay unchanged.
+Resident images have separate precision identities. The added raw weights are
+about **30 MiB**, with no KV token-pool reduction.
 
-Prefill can yield to active generations at complete layer boundaries. It saves
-and restores the existing BF16 hyper state, preserving the 4096-token prefill
-shape and the separate decode path. The Spark profile uses
-`DGPP_PREFILL_LAYER_YIELD=8`; 0 disables it. This requires one resident GPU and
-full reservation. Cancellation retains the normal scheduler retirement boundary.
-The extra workspace is **80 MiB** at the selected shape.
+Matched 93.8K code prefill averaged **1864 → 1871 tok/s**, effectively flat.
+C1 decode changed with text and draft acceptance (about −1.7% at 20K and +4.8%
+at 100K), so no kernel speedup or task-quality gain is claimed. This removes an
+extra checkpoint-weight rounding; the full task benchmark remains the quality gate.
 
-Matched temperature-zero/xhigh checks, with a cached 20K parent and a newly
-arriving 100K prompt:
+Upstream snapshot-boundary filtering is retained. Upstream removed the old cold
+`engine.prefill_group` switch after GLM consistency work. Qwen's grouped chunk
+path remains enabled and is still batch-dependent; no batch-invariance claim
+extends to this model.
 
-| Measurement | Yielding off | Eight-layer interval |
-| --- | --- | --- |
-| Longest parent pause, 1024 generated tokens | 2.51 s | 0.54 s |
-| Completion of a 256-token parent response | 60.1 s | 45.7 s |
-| Combined runtime, 1024-token case | 78.1 s | 78.4 s |
-| New prompt's first token, 1024-token case | 54.8 s | 61.0 s |
-
-Both responses match exactly in each comparison. Token budgets include reasoning.
-Yielding improves responsiveness under overlapping work; the new prompt waits
-longer while the existing generation makes progress. C1 has no peer to yield to.
-
-Concurrent 20K/100K retrieval, inspection and patch checks pass **24/24**, with
-all 16 follow-ups reusing their long prefix. Native checks cover unchanged logits,
-graph/cache/MTP 1/2/5, stop/cancel handling and positional boundaries; CUDA
-memcheck reports zero errors. These focused checks do not replace the user's
-full benchmark suite or establish full 512K/YaRN quality. Historical reasoning
-loops remain unresolved, and scheduling can still change floating-point execution
-shapes and generated text.
-
-Prompt lookup, adaptive draft-chain trimming, embedding-record caching and the
-shared expert scale-layout/CUTLASS prototype are excluded. Their focused tests
-found overhead or no dependable full-model gain. The expert prototype preserved
-tested values and improved its isolated operation, but model throughput stayed
-within roughly 1% of the control. There is no new CUTLASS build dependency.
+Shared-expert conversion caching, fused exact QSA selection, cross-slot prefix
+score reads, and GDN/residual preparation fusions are excluded. Focused comparisons
+found slower execution or no useful full-model gain. Their experimental source
+is separate from this release.
 
 ## Deployment profile
 
@@ -67,9 +49,22 @@ prefix cache, a 4 GiB dense-conversion cache, FP8 dense/MMA head, original BF16
 indexer, draft shortlist and bounded n-gram lookahead. Three full-context
 reservations fit; four do not.
 
-The startup memory plan is **111.02 GiB + 4 GiB guard**. Previous accepted
-attention, logits, expert-reuse, dense-cache and shared-prefix improvements remain.
-No checkpoint, KV precision, pool capacity or sampling change is made.
+`DGPP_PREFILL_LAYER_YIELD=8` retains the earlier responsiveness improvement:
+active generations get a decode pass at complete prefill layer boundaries.
+The existing BF16 hyper state and 4096-token prefill shape are preserved. It
+requires one resident GPU and full reservation and uses **80 MiB** of workspace.
+Set it to 0 and restart to disable yielding. Existing generations progress sooner;
+new prompts can wait longer for their first token. C1 has no peer to yield to.
+
+The memory plan is **111.05 GiB + 4 GiB guard**. Earlier accepted attention,
+logits, expert-reuse, dense-cache and shared-prefix improvements remain. No
+checkpoint, KV-cache precision, pool capacity or sampling change is made.
+
+Concurrent 20K/100K retrieval, inspection and patch checks pass **24/24**, with
+all 16 follow-ups reusing their prefixes. Native checks cover checkpoint bytes,
+resident images, cache/graph/MTP 1/2/5, yielding and positional ceilings; CUDA
+memcheck reports zero errors. Full-model checks use MTP-1. These checks do not
+establish full tool-eval quality, 512K/YaRN quality or a fix for historical loops.
 
 Pin the installed release. Keep site configuration and credentials outside
 published source. Rollback must restore both the previous JSON and `.env`;
