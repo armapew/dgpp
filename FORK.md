@@ -9,35 +9,36 @@ Correctness and accuracy take priority over throughput.
 | Reference | Value |
 | --- | --- |
 | Maintained branch | `spark` |
-| Immutable source tag | `spark-2026.09.29.1` |
-| Tested source | `620506561ee87155ac00fc0c8e575e70a915c907` |
-| Installed release | `0.1.0+g620506561ee8` |
+| Immutable source tag | `spark-2026.09.29.2` |
+| Tested source | `f380d2704d9131ed6f7f752db495577c958dc353` |
+| Installed release | `0.1.0+gf380d2704d91` |
 | Imported upstream | `84028a497443782d9f3dde08895c638658115933` |
-| Previous baseline | `spark-2026.09.28.7` / `44c5777` |
+| Previous baseline | `spark-2026.09.29.1` / `6205065` |
 
 The tag fixes the tested source. Maintained `spark` adds this profile document;
 engine, launcher, tests and build files match the tag. Published tags are immutable.
 
-The profile now keeps target-model attention K/V projections in original
-checkpoint BF16. `DGPP_QSA_TARGET_KV_BF16=1` enables it; 0 restores their FP8
-conversion on restart. Q/O, output-head and draft precision stay unchanged.
-Resident images have separate precision identities. The added raw weights are
-about **30 MiB**, with no KV token-pool reduction.
+`DGPP_MOE_GU_QUANT=1` fuses calibrated routed expert gate/up projection,
+SwiGLU and activation quantization during prefill. It preserves the existing
+BF16 roundings and accumulation order and reuses activation scratch. Set it to
+0 and restart to restore the original chain. Restored resident images recover
+the calibration metadata needed to select the same path as checkpoint loading.
 
-Matched 93.8K code prefill averaged **1864 → 1871 tok/s**, effectively flat.
-C1 decode changed with text and draft acceptance (about −1.7% at 20K and +4.8%
-at 100K), so no kernel speedup or task-quality gain is claimed. This removes an
-extra checkpoint-weight rounding; the full task benchmark remains the quality gate.
+Matched 93.8K code prefill averaged **1873 → 1937 tok/s** over two runs;
+100K inventory prefill improved **1864 → 1931 tok/s**. The observed gain is
+**3.4–3.6%**. Cached 100K aggregate decode at C1/C2/C4 remained essentially
+flat: **42.1/60.9/80.2 → 42.2/61.5/80.0 tok/s**. These are focused comparisons,
+not full benchmark-suite results.
 
 Upstream snapshot-boundary filtering is retained. Upstream removed the old cold
 `engine.prefill_group` switch after GLM consistency work. Qwen's grouped chunk
 path remains enabled and is still batch-dependent; no batch-invariance claim
 extends to this model.
 
-Shared-expert conversion caching, fused exact QSA selection, cross-slot prefix
-score reads, and GDN/residual preparation fusions are excluded. Focused comparisons
-found slower execution or no useful full-model gain. Their experimental source
-is separate from this release.
+Offline GEMM choices, newer cuBLASLt, prefetch suppression and small-group
+expert decode variants showed no useful serving gain and are excluded. FP32
+expert-down intermediates cost about 6% prefill throughput without a demonstrated
+task-quality benefit. Experimental source remains separate from this release.
 
 ## Deployment profile
 
@@ -46,8 +47,8 @@ and append [the runtime options](deploy/spark-runtime.env.example) to the existi
 site `.env`. The profile retains the 850048-token BF16 KV pool, 262144 tokens per
 request including output, four slots, MTP-1, 4096/4096 prefill budgets, a 3 GiB
 prefix cache, a 4 GiB dense-conversion cache, FP8 dense/MMA head, original BF16
-indexer, draft shortlist and bounded n-gram lookahead. Three full-context
-reservations fit; four do not.
+indexer and target K/V projections, draft shortlist and bounded n-gram lookahead.
+Three full-context reservations fit; four do not.
 
 `DGPP_PREFILL_LAYER_YIELD=8` retains the earlier responsiveness improvement:
 active generations get a decode pass at complete prefill layer boundaries.
@@ -61,10 +62,12 @@ logits, expert-reuse, dense-cache and shared-prefix improvements remain. No
 checkpoint, KV-cache precision, pool capacity or sampling change is made.
 
 Concurrent 20K/100K retrieval, inspection and patch checks pass **24/24**, with
-all 16 follow-ups reusing their prefixes. Native checks cover checkpoint bytes,
-resident images, cache/graph/MTP 1/2/5, yielding and positional ceilings; CUDA
-memcheck reports zero errors. Full-model checks use MTP-1. These checks do not
-establish full tool-eval quality, 512K/YaRN quality or a fix for historical loops.
+all 16 follow-ups reusing their prefixes. Fixed-history cold/cached and C1/C4
+probes match captured layer values and final logits bitwise with fusion off/on.
+Native checks cover ragged shapes, graph replay, resident restoration, cache/slot
+reuse, MTP 1–5 and yielding; CUDA memcheck reports zero errors. Full-model checks
+use MTP-1. These checks do not establish full tool-eval quality, batch invariance,
+512K/YaRN quality or a fix for historical loops.
 
 Pin the installed release. Keep site configuration and credentials outside
 published source. Rollback must restore both the previous JSON and `.env`;
