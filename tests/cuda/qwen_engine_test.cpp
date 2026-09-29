@@ -875,7 +875,7 @@ DGPP_TEST(qwen_compact_logits_preserve_cache_concurrency_and_mtp) {
   }
 }
 
-static void check_fp4_reuse_lifecycle(const char* env_key) {
+static void check_fp4_optimization_lifecycle(const char* env_key) {
   struct RestoreModes {
     const char* key;
     bool mapped = dgpp::QwenLayerStream::ngram_table_mmap();
@@ -896,16 +896,18 @@ static void check_fp4_reuse_lifecycle(const char* env_key) {
   const auto cfg = qwenfx::tiny_nvfp4_config();
   const std::string dir = std::string("qwen_fp4_reuse_fixture_") + env_key;
   qwenfx::write_fixture(cfg, dir, qwenfx::tiny_text_json(), qwenfx::tiny_nvfp4_quant_json());
+  const bool fused_prefill = std::string(env_key) == "DGPP_MOE_GU_QUANT";
   const std::vector<int> limits{12, 28, 36, 44};
   std::vector<std::vector<int64_t>> prompts;
-  for (int i = 0; i < 4; ++i) prompts.push_back(smoke_tokens(cfg, 17 + i * 8, 0xAB00 + i));
+  for (int i = 0; i < 4; ++i)
+    prompts.push_back(smoke_tokens(cfg, (fused_prefill ? 65 : 17) + i * 8, 0xAB00 + i));
   for (int depth : {1, 2, 3, 4, 5}) {
     const auto run = [&](bool reuse) {
       setenv(env_key, reuse ? "1" : "0", 1);
       auto buses = start_world(1, kPort + 24);
       require(buses.size() == 1, "expert reuse: world-of-one bus");
       const int rows = 4 * (depth + 1);
-      QwenModel model(cfg, dir, 128, 2048, QwenResidency::Resident, nullptr, 0, 1,
+      QwenModel model(cfg, dir, fused_prefill ? 512 : 128, 2048, QwenResidency::Resident, nullptr, 0, 1,
                       4, true, rows, true, true);
       require(cfg.experts_nvfp4 && cfg.hidden_size == 256, "fixture must exercise NVFP4 reuse");
       uint16_t* scratch = nullptr;
@@ -1007,13 +1009,13 @@ static void check_fp4_reuse_lifecycle(const char* env_key) {
 }
 
 DGPP_TEST(qwen_fp4_gate_reuse_preserves_cache_concurrency_and_mtp) {
-  check_fp4_reuse_lifecycle("DGPP_FP4_GATE_REUSE");
+  check_fp4_optimization_lifecycle("DGPP_FP4_GATE_REUSE");
 }
 
 DGPP_TEST(qwen_fp4_down_reuse_preserves_cache_concurrency_and_mtp) {
   const char* gate = std::getenv("DGPP_FP4_GATE_REUSE");
   require(!gate || gate[0] != '0', "down reuse check requires the existing gate grouping");
-  check_fp4_reuse_lifecycle("DGPP_FP4_DOWN_REUSE");
+  check_fp4_optimization_lifecycle("DGPP_FP4_DOWN_REUSE");
 }
 
 DGPP_TEST(qwen_engines_request_bound_stripe_holds_a_depth5_verify_at_a_block_aligned_ceiling) {
@@ -1856,6 +1858,10 @@ DGPP_TEST(qwen_wide_bf16_dense_real_shards_are_kernel_only) {
     rejected = std::string(e.what()).find("refusing cuBLASLt fallback") != std::string::npos;
   }
   require(rejected, "unaligned wide MTP weights fail before an Lt fallback");
+}
+
+DGPP_TEST(qwen_fused_expert_prefill_preserves_cache_concurrency_and_mtp) {
+  check_fp4_optimization_lifecycle("DGPP_MOE_GU_QUANT");
 }
 
 int main() { return dgpp::test::run_all(); }

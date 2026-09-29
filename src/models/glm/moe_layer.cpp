@@ -789,6 +789,9 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
       launch_moe_grouped_gemv_bf16(d_gather_, H, sg, ns, mr, split, d_views_prefill_,
                                    which, out, I_max, n, H, stream);
   };
+  const uint8_t* down_codes = d_q_codes_;
+  const uint8_t* down_scales = d_q_scales_;
+  const float* down_gs = d_q_gs_;
   auto gemm_f32 = [&](const MoeSegment* sg, int ns, int mr, int split, int k,
                       bool routed_arg) {
     const bool routed = routed_arg || shared_fp4;
@@ -800,10 +803,10 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                         2, d_down_, H, H, k,
                                         routed_arg ? routed_bits : shared_bits, stream);
     else if (w4a4 && routed_arg && down_bf16_)
-      launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2,
+      launch_moe_grouped_w4a4_bf16(down_codes, down_scales, down_gs, nullptr, sg, ns, mr, d_views_prefill_, 2,
                                    reinterpret_cast<uint16_t*>(d_down_), H, H, k, stream);
     else if (w4a4 && routed_arg)
-      launch_moe_grouped_w4a4_f32(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H,
+      launch_moe_grouped_w4a4_f32(down_codes, down_scales, down_gs, nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H,
                                   k, stream);
     else if (mma && routed && fp4)
       launch_moe_grouped_mma_fp4_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
@@ -818,32 +821,63 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
       launch_moe_grouped_gemv_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
                                   2, d_down_, H, H, k, stream);
   };
-  gemm_bf16(segs, n_segs, max_rows, 0, 0, d_gate_, I_r, true);
-  if (shared_seg) gemm_bf16(shared_seg, 1, tokens, shared_split, 0, d_gate_, I_s, false);
-  gemm_bf16(segs, n_segs, max_rows, 0, 1, d_up_, I_r, true);
-  if (shared_seg) gemm_bf16(shared_seg, 1, tokens, shared_split, 1, d_up_, I_s, false);
-  // The down projection's activations to NVFP4 (routed rows; the shared
-  // expert's rows, when present, sit past them and keep the bf16 path).
-  // Without a shared segment the bf16 act buffer feeds nothing but that
-  // quantizer, so the activation runs inside it (bitwise the two-kernel chain;
-  // DGPP_MOE_SWIGLU_QUANT=0 keeps the two launches).
   static const bool fused_act = [] {
     const char* e = std::getenv("DGPP_MOE_SWIGLU_QUANT");
     return e == nullptr || e[0] != '0';
   }();
   const bool fused_swiglu =
       w4a4 && shared_seg == nullptr && fused_act && I_max == static_cast<size_t>(I_r);
-  if (fused_swiglu) {
-    launch_swiglu_quantize_rows_nvfp4(d_gate_, d_up_, I_max, static_cast<int>(rows_total), I_r, cfg_.swiglu_limit,
-                                      d_q_codes_, d_q_scales_, d_q_gs_, stream,
-                                      0.f, moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);
+  const char* pair_flag = std::getenv("DGPP_MOE_GU_QUANT");
+  if (pair_flag && *pair_flag && std::string(pair_flag) != "0" && std::string(pair_flag) != "1")
+    throw std::invalid_argument("DGPP_MOE_GU_QUANT must be 0 or 1");
+  const bool pair_quant = pair_flag && pair_flag[0] == '1' && w4a4 && !shared_seg &&
+      I_max == static_cast<size_t>(I_r) && moe_w4a4_static() && w_.act_scales_dev &&
+      w_.act_scale_w2 > 0.f && std::isfinite(w_.act_scale_w2) && std::getenv("DGPP_MOE_CHAIN_DUMP") == nullptr;
+  if (pair_quant) {
+    static const bool logged = [] {
+      DGPP_LOG_INFO("moe: fused calibrated gate/up, SwiGLU and NVFP4 quantization enabled");
+      return true;
+    }();
+    (void)logged;
+    // d_act_ is unused by this path. Keep input quantization alive while
+    // fused CTAs emit the distinct down input into this existing BF16 buffer.
+    const auto align = [](size_t n) { return (n + 255) & ~size_t(255); };
+    const size_t code_bytes = align(rows_total * I_r / 2);
+    const size_t scale_bytes = align(rows_total * nvfp4_act_scale_stride(I_r));
+    const size_t capacity = static_cast<size_t>(max_tokens_) * (cfg_.top_k + 1) * I_max * 2;
+    if (code_bytes + scale_bytes + rows_total * sizeof(float) > capacity)
+      throw std::logic_error("fused gate/up quant scratch exceeds activation buffer");
+    auto* codes = reinterpret_cast<uint8_t*>(d_act_);
+    auto* scales = codes + code_bytes;
+    auto* gs = reinterpret_cast<float*>(scales + scale_bytes);
+    launch_moe_w4a4_pair_quant(d_q_codes_, d_q_scales_, d_q_gs_, d_rows_, segs, n_segs, max_rows,
+                               d_views_prefill_, I_r, H, cfg_.swiglu_limit, codes, scales, gs,
+                               w_.act_scales_dev + 1, stream);
+    down_codes = codes;
+    down_scales = scales;
+    down_gs = gs;
   } else {
-    launch_moe_swiglu_clamp(d_gate_, d_up_, d_act_,
-                            static_cast<int64_t>(rows_total) * I_max,
-                            cfg_.swiglu_limit, stream);
-    if (w4a4)
-      launch_quantize_rows_nvfp4(d_act_, I_max, static_cast<int>(rows_total), I_r, d_q_codes_, d_q_scales_, d_q_gs_,
-                                 stream, 0.f, moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);
+    gemm_bf16(segs, n_segs, max_rows, 0, 0, d_gate_, I_r, true);
+    if (shared_seg) gemm_bf16(shared_seg, 1, tokens, shared_split, 0, d_gate_, I_s, false);
+    gemm_bf16(segs, n_segs, max_rows, 0, 1, d_up_, I_r, true);
+    if (shared_seg) gemm_bf16(shared_seg, 1, tokens, shared_split, 1, d_up_, I_s, false);
+    // The down projection's activations to NVFP4 (routed rows; the shared
+    // expert's rows, when present, sit past them and keep the bf16 path).
+    // Without a shared segment the bf16 act buffer feeds nothing but that
+    // quantizer, so the activation runs inside it (bitwise the two-kernel chain;
+    // DGPP_MOE_SWIGLU_QUANT=0 keeps the two launches).
+    if (fused_swiglu) {
+      launch_swiglu_quantize_rows_nvfp4(d_gate_, d_up_, I_max, static_cast<int>(rows_total), I_r, cfg_.swiglu_limit,
+                                        d_q_codes_, d_q_scales_, d_q_gs_, stream,
+                                        0.f, moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);
+    } else {
+      launch_moe_swiglu_clamp(d_gate_, d_up_, d_act_,
+                              static_cast<int64_t>(rows_total) * I_max,
+                              cfg_.swiglu_limit, stream);
+      if (w4a4)
+        launch_quantize_rows_nvfp4(d_act_, I_max, static_cast<int>(rows_total), I_r, d_q_codes_, d_q_scales_, d_q_gs_,
+                                   stream, 0.f, moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);
+    }
   }
   gemm_f32(segs, n_segs, max_rows, 0, I_r, true);
   if (shared_seg) gemm_f32(shared_seg, 1, tokens, shared_split, I_s, false);

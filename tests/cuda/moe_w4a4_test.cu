@@ -173,10 +173,17 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_exact, const
 
   // 1. layouts: fp64 dot of the quantized operands, dequantized exactly.
   if (check_exact) {
+    auto* bfout = dev(std::vector<uint16_t>(static_cast<size_t>(rows) * n));
+    launch_moe_grouped_w4a4_bf16(codes, scales, gs, act_rows, segs, ns, c.max_rows, d.views, 0,
+                                bfout, n, n, k, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    const auto ob = host(bfout, static_cast<size_t>(rows) * n);
+    cudaFree(bfout);
     const auto qc = host(codes, static_cast<size_t>(tokens) * k / 2);
     const auto qs = host(scales, static_cast<size_t>(tokens) * ss);
     const auto qg = host(gs, static_cast<size_t>(tokens));
     double worst = 0;
+    double error32 = 0, error16 = 0, reference2 = 0;
     for (const MoeSegment& s : c.segs) {
       const Matrix& m = c.w[s.expert];
       for (int r = 0; r < s.rows; r += std::max(1, s.rows / 3)) {
@@ -195,10 +202,16 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_exact, const
           const double got = o4[static_cast<size_t>(s.row0 + r) * n + col];
           const double err = std::fabs(got - dot) / (mag + 1e-30);
           worst = std::max(worst, err);
+          const double rounded = bf16_bits_to_float(ob[static_cast<size_t>(s.row0 + r) * n + col]);
+          error32 += (got-dot)*(got-dot);
+          error16 += (rounded-dot)*(rounded-dot);
+          reference2 += dot*dot;
         }
       }
     }
     std::printf("[ .. ] %s layouts: worst |got - fp64| / sum|terms| = %.3g\n", label, worst);
+    std::printf("[ .. ] %s relative L2 vs FP64 quantized-operand oracle: f32=%.9g bf16=%.9g\n",
+                label, std::sqrt(error32/(reference2+1e-30)), std::sqrt(error16/(reference2+1e-30)));
     if (!(worst < 1e-5)) {
       std::printf("[FAIL] %s: the W4A4 kernel does not compute the quantized dot\n", label);
       ++fails;
@@ -259,6 +272,99 @@ int run(int tokens, int experts, int topk, int n, int k, bool check_exact, const
   return fails;
 }
 
+int pair_quant_case(int tokens, int experts, int topk, int n, int k) {
+  const Case c = make_case(tokens, experts, topk, n, k, 991);
+  const Case u = make_case(tokens, experts, topk, n, k, 992);
+  const Device dg = upload(c), du = upload(u);
+  auto views = host(dg.views, size_t(experts) * 3);
+  const auto up_views = host(du.views, views.size());
+  for (int e = 0; e < experts; ++e) views[e * 3 + 1] = up_views[e * 3];
+  auto* dv = dev(views);
+  const int rows = static_cast<int>(c.act_rows.size());
+  auto* act = dev(c.act);
+  auto* segs = dev(c.segs);
+  auto* rowmap = dev(c.act_rows);
+  auto* ac = dev(std::vector<uint8_t>(size_t(tokens) * k / 2));
+  auto* as = dev(std::vector<uint8_t>(size_t(tokens) * nvfp4_act_scale_stride(k)));
+  auto* ag = dev(std::vector<float>(tokens));
+  auto* gate = dev(std::vector<uint16_t>(size_t(rows) * n));
+  auto* up = dev(std::vector<uint16_t>(size_t(rows) * n));
+  auto* oc1 = dev(std::vector<uint8_t>(size_t(rows) * n / 2));
+  auto* oc2 = dev(std::vector<uint8_t>(size_t(rows) * n / 2));
+  auto* os1 = dev(std::vector<uint8_t>(size_t(rows) * nvfp4_act_scale_stride(n)));
+  auto* os2 = dev(std::vector<uint8_t>(size_t(rows) * nvfp4_act_scale_stride(n)));
+  auto* og1 = dev(std::vector<float>(rows));
+  auto* og2 = dev(std::vector<float>(rows));
+  const float scale = 2.f / (6.f * 448.f), limit = 7.f;
+  auto* dscale = dev(std::vector<float>{scale});
+  cudaStream_t stream;
+  DGPP_CUDA_OK(cudaStreamCreate(&stream));
+  launch_quantize_rows_nvfp4(act, k, tokens, k, ac, as, ag, stream, scale);
+  const int ns = static_cast<int>(c.segs.size());
+  auto control = [&] {
+    launch_moe_grouped_w4a4_bf16(ac, as, ag, rowmap, segs, ns, c.max_rows, dv, 0, gate, n, n, k, stream);
+    launch_moe_grouped_w4a4_bf16(ac, as, ag, rowmap, segs, ns, c.max_rows, dv, 1, up, n, n, k, stream);
+    launch_swiglu_quantize_rows_nvfp4(gate, up, n, rows, n, limit, oc1, os1, og1, stream, 0.f, dscale);
+  };
+  auto fused = [&] {
+    launch_moe_w4a4_pair_quant(ac, as, ag, rowmap, segs, ns, c.max_rows, dv, n, k, limit,
+                              oc2, os2, og2, dscale, stream);
+  };
+  control(); fused();
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  auto compare = [&] {
+    return host(oc1, size_t(rows) * n / 2) == host(oc2, size_t(rows) * n / 2) &&
+           host(os1, size_t(rows) * nvfp4_act_scale_stride(n)) == host(os2, size_t(rows) * nvfp4_act_scale_stride(n)) &&
+           host(og1, rows) == host(og2, rows);
+  };
+  bool same = compare();
+  cudaGraph_t graph;
+  cudaGraphExec_t exec;
+  DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+  fused();
+  DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+  DGPP_CUDA_OK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+  // Replay against new data and a different static scale to catch captured values.
+  std::vector<uint16_t> changed = c.act;
+  for (auto& x : changed) x = bf16(bf16_bits_to_float(x) * .625f);
+  const float changed_scale = scale * 1.125f;
+  DGPP_CUDA_OK(cudaMemcpyAsync(act, changed.data(), changed.size() * 2, cudaMemcpyHostToDevice, stream));
+  DGPP_CUDA_OK(cudaMemcpyAsync(dscale, &changed_scale, 4, cudaMemcpyHostToDevice, stream));
+  launch_quantize_rows_nvfp4(act, k, tokens, k, ac, as, ag, stream, scale);
+  control();
+  DGPP_CUDA_OK(cudaGraphLaunch(exec, stream));
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  same &= compare();
+  cudaEvent_t e0, e1;
+  DGPP_CUDA_OK(cudaEventCreate(&e0)); DGPP_CUDA_OK(cudaEventCreate(&e1));
+  auto timing = [&](auto fn) {
+    for (int i = 0; i < 3; ++i) fn();
+    DGPP_CUDA_OK(cudaEventRecord(e0, stream));
+    for (int i = 0; i < 10; ++i) fn();
+    DGPP_CUDA_OK(cudaEventRecord(e1, stream));
+    DGPP_CUDA_OK(cudaEventSynchronize(e1));
+    float ms = 0;
+    DGPP_CUDA_OK(cudaEventElapsedTime(&ms, e0, e1));
+    return ms / 10;
+  };
+  const float base_ms = timing(control), fused_ms = timing(fused);
+  std::printf("[ %s ] pair-quant T=%d E=%d K=%d N=%d H=%d rows=%d control=%.4f fused=%.4f ms speedup=%.3f bitwise/graph=%d\n",
+              same ? "OK" : "FAIL", tokens, experts, topk, n, k, rows, base_ms, fused_ms, base_ms / fused_ms, same);
+  cudaEventDestroy(e0); cudaEventDestroy(e1); cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
+  cudaStreamDestroy(stream);
+  for (const Device* d : {&dg, &du}) {
+    for (void* p : d->bufs) cudaFree(p);
+    for (void* p : d->globals) cudaFree(p);
+    cudaFree(d->views);
+  }
+  for (void* p : {static_cast<void*>(dv), static_cast<void*>(act), static_cast<void*>(segs),
+                 static_cast<void*>(rowmap), static_cast<void*>(ac), static_cast<void*>(as),
+                 static_cast<void*>(ag), static_cast<void*>(gate), static_cast<void*>(up),
+                 static_cast<void*>(oc1), static_cast<void*>(oc2), static_cast<void*>(os1),
+                 static_cast<void*>(os2), static_cast<void*>(og1), static_cast<void*>(og2), static_cast<void*>(dscale)}) cudaFree(p);
+  return same ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -275,6 +381,12 @@ int main(int argc, char** argv) {
     else if (a == "--topk") topk = std::atoi(argv[++i]);
   }
   int fails = 0;
+  if (argc > 1 && std::string(argv[1]) == "--pair-quant") {
+    fails += pair_quant_case(37, 8, 3, 320, 320);
+    fails += pair_quant_case(130, 16, 4, 640, 2560);
+    fails += pair_quant_case(tokens, experts, topk, 640, 2560);
+    return fails ? 1 : 0;
+  }
   // Small shapes with ragged segments and k tails for the exact layout check.
   fails += run(64, 8, 2, 256, 256, true, "small");
   fails += run(200, 16, 4, 320, 320, true, "k320");
@@ -282,6 +394,7 @@ int main(int argc, char** argv) {
   // A static global (the checkpoint's input_scale form) small enough that the
   // 20x outliers clip: the layouts must still be exact on the clipped codes.
   fails += run(200, 16, 4, 320, 320, true, "static-clip", 2.0f / (6.f * 448.f));
+  fails += run(37, 8, 3, 2560, 640, true, "down-oracle", 2.0f / (6.f * 448.f));
   // Prefill shapes (the Qwen experts per rank at TP=2: gate/up n = 320,
   // k = 2560; down n = 2560, k = 320).
   fails += run(tokens, experts, topk, 640, 2560, false, "gate_up");

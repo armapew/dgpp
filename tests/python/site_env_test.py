@@ -69,6 +69,7 @@ class SiteEnvTest(unittest.TestCase):
                    "DGPP_SKIP_PREFILL_OUTPUT": "1",
                    "DGPP_PREFIX_COALESCE": "1", "DGPP_QSA_INDEXER_BF16": "1", "DGPP_NGRAM_STAGING": "1",
                    "DGPP_QSA_DECODE_QUERY_TILE": "2", "DGPP_DRAFT_VOCAB_LIMIT": "65536",
+                   "DGPP_MOE_GU_QUANT": "1",
                    "DGPP_NGRAM_LOOKAHEAD_TOKENS": "8192"}
         with self.env_file.open("a") as f:
             for key, value in options.items():

@@ -42,4 +42,14 @@ void launch_moe_grouped_w4a4_f32(const uint8_t* codes, const uint8_t* scales, co
                                  const MoeExpertView* views, int which, float* out, size_t out_stride, int n, int k,
                                  cudaStream_t stream);
 
+// Calibrated prefill only, with positive finite *static_gs. Gate/up and SwiGLU
+// retain the original BF16 roundings before NVFP4 quantization. Input/output
+// codes, scales and globals must not alias; existing activation scratch can
+// hold the down input. Shape: n,k are positive multiples of 64.
+void launch_moe_w4a4_pair_quant(const uint8_t* codes, const uint8_t* scales, const float* gs,
+                               const int32_t* act_rows, const MoeSegment* segs, int n_segs, int max_rows,
+                               const MoeExpertView* views, int n, int k, float limit,
+                               uint8_t* out_codes, uint8_t* out_scales, float* out_gs,
+                               const float* static_gs, cudaStream_t stream);
+
 }  // namespace dgpp

@@ -526,8 +526,8 @@ DGPP_TEST(qwen_loader_nvfp4_activation_scales_survive_image_restore) {
     else {
       require(stream.image_layers_restored() == 1, "the second load restores the NVFP4 image");
       require(
-          layer.moe.act_scale_w13 == 0.f && layer.moe.act_scale_w2 == 0.f,
-          "restore obtains activation globals from the image without rereading them on the host");
+          layer.moe.act_scale_w13 == scales[0] && layer.moe.act_scale_w2 == scales[1],
+          "restore recovers host eligibility metadata from the authoritative image scales");
     }
   }
   QwenLayerStream::set_resident_image_dir(saved);

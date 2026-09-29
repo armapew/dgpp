@@ -630,6 +630,15 @@ size_t QwenLoaderFamily::extra_resident_bytes(const QwenTextConfig& cfg, int ran
 // The restored PLE layer's host-side scale: from the source when mapped.
 void QwenLoaderFamily::after_restore(const QwenTextConfig& cfg, int layer,
                                      const LoaderTensorMap& tensors, QwenLayerResident& out) {
+  // The layout-only restore does not read checkpoint input_scale tensors.
+  // Recover these two host metadata values from the authoritative image bytes
+  // before choosing a calibrated-only expert path. No per-request readback.
+  if (out.moe.act_scales) {
+    float scales[2];
+    DGPP_CUDA_OK(cudaMemcpy(scales, out.moe.act_scales, sizeof(scales), cudaMemcpyDeviceToHost));
+    out.moe.act_scale_w13 = scales[0];
+    out.moe.act_scale_w2 = scales[1];
+  }
   if (!out.has_ple || tensors.empty()) return;
   const std::string name = qwen_layer_prefix(cfg, layer) + "ple.ple_embedding.ngram_embedding.weight_scale";
   uint16_t bits;

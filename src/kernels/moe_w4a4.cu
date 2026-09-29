@@ -206,12 +206,14 @@ __device__ __forceinline__ void store_pair(uint16_t* p, float a, float b) {
 }
 __device__ __forceinline__ void store_pair(float* p, float a, float b) { *reinterpret_cast<float2*>(p) = make_float2(a, b); }
 
-template <typename OutT, int kStages, int kBM, int kNT = 1>
-__global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
+// Epilogue 0 writes logical output rows; 1 stages gate BF16 in a shared tile;
+// 2 rounds up to BF16, then replaces the tile with rounded SwiGLU values.
+template <typename OutT, int kStages, int kBM, int kNT, int Epilogue = 0>
+__device__ __forceinline__ void w4a4_tile(
     const uint8_t* __restrict__ a_codes, size_t a_code_stride, const uint8_t* __restrict__ a_scales,
     size_t a_scale_stride, const float* __restrict__ a_gs, const int32_t* __restrict__ act_rows,
     const MoeSegment* __restrict__ segs, const MoeExpertView* __restrict__ views, int which,
-    OutT* __restrict__ out, size_t out_stride, int n, int k, int m_tiles) {
+    OutT* __restrict__ out, size_t out_stride, int n, int k, int m_tiles, float limit) {
   using namespace w4a4;
   using TL = Tile<kBM>;
   constexpr size_t kACodesT = TL::a_codes, kAScalesT = TL::a_scales, kSlotT = TL::slot;
@@ -384,7 +386,7 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
           if (mm >= m_rows) continue;
           const int srow = seg.row0 + m0 + mm;
           const float scale = a_gs[act_rows != nullptr ? act_rows[srow] : srow] * inv_g;
-          OutT* orow = out + static_cast<size_t>(srow) * out_stride;
+          OutT* orow = out + static_cast<size_t>(Epilogue ? mm : srow) * out_stride;
 #pragma unroll
           for (int j = 0; j < NT; ++j) {
             const int col = n0 + wn * NC + j * 8 + 2 * t;
@@ -392,9 +394,17 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
             // and rows are even-strided (the element-at-a-time stores made the
             // output-heavy down projection store-instruction bound).
             if (col + 1 < n) {
-              store_pair(orow + col, acc[i][j][2 * h] * scale, acc[i][j][2 * h + 1] * scale);
-            } else if (col < n) {
-              store_out(orow + col, acc[i][j][2 * h] * scale);
+              const float a = acc[i][j][2 * h] * scale, b = acc[i][j][2 * h + 1] * scale;
+              if constexpr (Epilogue == 2) {
+                const __nv_bfloat16 ua = __float2bfloat16_rn(a), ub = __float2bfloat16_rn(b);
+                store_pair(orow + col - n0,
+                    swiglu_bf16(orow[col - n0], *reinterpret_cast<const uint16_t*>(&ua), limit),
+                    swiglu_bf16(orow[col + 1 - n0], *reinterpret_cast<const uint16_t*>(&ub), limit));
+              } else {
+                store_pair(orow + col - (Epilogue ? n0 : 0), a, b);
+              }
+            } else if constexpr (Epilogue == 0) {
+              if (col < n) store_out(orow + col, acc[i][j][2 * h] * scale);
             }
           }
         }
@@ -406,6 +416,67 @@ __global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
     }
   }
   cp_wait<0>();
+}
+
+template <typename OutT, int kStages, int kBM, int kNT = 1>
+__global__ __launch_bounds__(w4a4::kThreads, 2) void moe_grouped_w4a4_kernel(
+    const uint8_t* a_codes, size_t a_code_stride, const uint8_t* a_scales,
+    size_t a_scale_stride, const float* a_gs, const int32_t* act_rows,
+    const MoeSegment* segs, const MoeExpertView* views, int which,
+    OutT* out, size_t out_stride, int n, int k, int m_tiles) {
+  w4a4_tile<OutT, kStages, kBM, kNT>(a_codes, a_code_stride, a_scales, a_scale_stride,
+      a_gs, act_rows, segs, views, which, out, out_stride, n, k, m_tiles, 0.f);
+}
+
+// Tile-local BF16 projection/activation roundings; distinct input/output quant
+// buffers are required because all CTAs can still read the input activations.
+__global__ __launch_bounds__(w4a4::kThreads, 2) void moe_w4a4_pair_quant_kernel(
+    const uint8_t* codes, size_t cs, const uint8_t* scales, size_t ss, const float* gs,
+    const int32_t* act_rows, const MoeSegment* segs, const MoeExpertView* views,
+    uint8_t* output_codes, size_t ocs, uint8_t* output_scales, size_t oss, float* output_gs,
+    const float* static_output_gs, int n, int k, int m_tiles, float limit) {
+  using namespace w4a4;
+  extern __shared__ __align__(16) uint8_t smem[];
+  const MoeSegment seg = segs[blockIdx.y];
+  const int m0 = (static_cast<int>(blockIdx.x) % m_tiles) * 64;
+  if (m0 >= seg.rows) return;
+  const int n0 = (static_cast<int>(blockIdx.x) / m_tiles) * BN;
+  uint16_t* tile = reinterpret_cast<uint16_t*>(smem + smem_bytes_bm<2, 64>());
+  w4a4_tile<uint16_t, 2, 64, 1, 1>(codes, cs, scales, ss, gs, act_rows, segs, views,
+                                  0, tile, BN, n, k, m_tiles, limit);
+  __syncthreads();
+  w4a4_tile<uint16_t, 2, 64, 1, 2>(codes, cs, scales, ss, gs, act_rows, segs, views,
+                                  1, tile, BN, n, k, m_tiles, limit);
+  __syncthreads();
+  const float global = *static_output_gs;
+  const int rows = min(64, seg.rows - m0);
+  for (int task = threadIdx.x; task < rows * (BN / 16); task += blockDim.x) {
+    const int row = task / (BN / 16), group = task % (BN / 16), col = n0 + group * 16;
+    if (col >= n) continue;
+    float v[16], amax = 0.f;
+#pragma unroll
+    for (int q = 0; q < 16; ++q) {
+      v[q] = __uint_as_float(static_cast<uint32_t>(tile[row * BN + group * 16 + q]) << 16);
+      amax = fmaxf(amax, fabsf(v[q]));
+    }
+    const int output_row = seg.row0 + m0 + row;
+    // One writer per row, including when this expert spans multiple N tiles.
+    if (col == 0) output_gs[output_row] = global;
+    uint8_t* out = output_codes + static_cast<size_t>(output_row) * ocs + col / 2;
+    uint8_t* scale = output_scales + static_cast<size_t>(output_row) * oss + col / 16;
+    const __nv_fp8_e4m3 packed(amax / (6.f * global));
+    const float bs = static_cast<float>(packed);
+    if (amax == 0.f || bs == 0.f) {
+      *scale = 0;
+      *reinterpret_cast<uint2*>(out) = make_uint2(0, 0);
+    } else {
+      *scale = packed.__x;
+      const float inv = 1.f / (bs * global);
+#pragma unroll
+      for (int q = 0; q < 16; ++q) v[q] *= inv;
+      *reinterpret_cast<uint2*>(out) = make_uint2(f32x8_to_e2m1(v), f32x8_to_e2m1(v + 8));
+    }
+  }
 }
 
 }  // namespace
@@ -528,6 +599,30 @@ void launch_moe_grouped_w4a4_f32(const uint8_t* codes, const uint8_t* scales, co
                                  cudaStream_t stream) {
   launch_w4a4<float>(codes, scales, gs, act_rows, segs, n_segs, max_rows, views, which, out, out_stride, n, k,
                      stream);
+}
+
+void launch_moe_w4a4_pair_quant(const uint8_t* codes, const uint8_t* scales, const float* gs,
+                               const int32_t* act_rows, const MoeSegment* segs, int n_segs, int max_rows,
+                               const MoeExpertView* views, int n, int k, float limit,
+                               uint8_t* out_codes, uint8_t* out_scales, float* out_gs,
+                               const float* static_gs, cudaStream_t stream) {
+  if (n_segs <= 0) return;
+  if (n <= 0 || k <= 0 || n % 64 || k % 64 || max_rows <= 0 || !static_gs ||
+      codes == out_codes || scales == out_scales || gs == out_gs)
+    throw std::invalid_argument("fused gate/up quant: invalid shape, scale or aliased input/output");
+  constexpr size_t bytes = w4a4::smem_bytes_bm<2, 64>() + size_t(64) * w4a4::BN * 2;
+  static const bool attr = [] {
+    DGPP_CUDA_OK(cudaFuncSetAttribute(moe_w4a4_pair_quant_kernel,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
+    return true;
+  }();
+  (void)attr;
+  const int m_tiles = (max_rows + 63) / 64;
+  const dim3 grid(((n + w4a4::BN - 1) / w4a4::BN) * m_tiles, n_segs);
+  moe_w4a4_pair_quant_kernel<<<grid, w4a4::kThreads, bytes, stream>>>(
+      codes, k / 2, scales, nvfp4_act_scale_stride(k), gs, act_rows, segs, views,
+      out_codes, n / 2, out_scales, nvfp4_act_scale_stride(n), out_gs, static_gs, n, k, m_tiles, limit);
+  DGPP_CUDA_OK(cudaGetLastError());
 }
 
 }  // namespace dgpp
