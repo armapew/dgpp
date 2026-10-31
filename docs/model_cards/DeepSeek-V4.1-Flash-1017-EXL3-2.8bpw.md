@@ -114,5 +114,20 @@ tool calls despite valid final JSON. No full-suite score is inferred.
 Focused C4 checks also covered sampled/streamed required and named tools,
 automatic replies, schema output with tool-result replay, cached follow-ups
 and cancellation/slot reuse. Both ranks stayed at zero process swap, with no
-service failures. Vision, client integration and the operator's full text
-benchmark remain later acceptance gates.
+service failures. Vision and client integration remain later work; focused
+checks alone do not establish full-suite quality.
+
+The operator's subsequent full run on this build scored 199/208 (97 passes,
+five partials, two failures), with all 104 scenarios scored using the same
+evaluator, T0, seed 42, xhigh and C3. This matches the comparison TensorFold
+run's aggregate score, with different per-case outcomes. Performance parity
+and general quality parity are not established.
+
+A remaining JSON/tool interaction was isolated with an identical native prompt:
+the constrained Chat Completions path emits a calculator call, while the
+unconstrained continuation has identical reasoning followed by fenced JSON.
+The native render matches the reference byte-for-byte. Handling the preferred
+wrapper without redirecting an answer into a tool call remains serving work;
+do not disable structured-output validation or alter the evaluator as a remedy.
+Fixed depth-5 verification, prefill and prefix-cache behavior remain separate
+optimization candidates requiring measured validation on this mixed pack.
