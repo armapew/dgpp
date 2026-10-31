@@ -29,6 +29,7 @@
     "mtp_schedule_sampled_scale": 0.93,
     "mtp_verify": "block",
     "prefix_cache_gib": 1,
+    "prefix_min_tokens": 256,
     "admission": "full",
     "admission_window": 256,
     "sampling_candidates": 128,
