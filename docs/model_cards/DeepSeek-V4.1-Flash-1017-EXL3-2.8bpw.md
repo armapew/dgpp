@@ -95,3 +95,24 @@ These are bounded correctness and deployment checks, not a full quality or
 performance campaign. Quality above roughly 100K context, maximum-pool C4,
 vision and Responses/client integration remain unvalidated. The operator's
 full text evaluation is the next acceptance gate.
+
+## Serving-contract corrections
+
+Build `9eb7718e21fd` adds native response-format schema prompting after the
+tool block and enforces required/named DSML tool openers after reasoning ends.
+The renderer's cache-identity revision is bumped. Model weights, routing,
+KV formats, sampling and the initial profile above are unchanged.
+
+Validation passed 122 HTTP/service tests, 26 grammar tests, the original 20
+reference prompt fixtures and four schema fixtures (exact bytes and tokenizer
+IDs), plus required/named calls with the actual tokenizer. On two GB10 nodes,
+the unmodified tool-eval-bench 3.0.1.dev7+g887b53757 capability probe completed
+with a valid call and arguments in its first 256-token attempt. At T0, seed 42,
+xhigh and C3, TC-45/64/65/66/69 passed; TC-67/68 remained partial for unnecessary
+tool calls despite valid final JSON. No full-suite score is inferred.
+
+Focused C4 checks also covered sampled/streamed required and named tools,
+automatic replies, schema output with tool-result replay, cached follow-ups
+and cancellation/slot reuse. Both ranks stayed at zero process swap, with no
+service failures. Vision, client integration and the operator's full text
+benchmark remain later acceptance gates.
