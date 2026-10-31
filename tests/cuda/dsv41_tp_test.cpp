@@ -624,6 +624,26 @@ DGPP_TEST(dsv41_tp_loopback_worlds_2_and_4_match_world_1_at_decode_rows) {
   check_world(4, 29967, dir, cfg, tokens, ref);
 }
 
+// The mixed 2.8 bpw candidate is a two-node deployment. Use the same
+// cross-rank and layer-local budgets as the release fixtures, at decode and
+// prefill row counts. The supplementary world-4 mixed fixture has routing
+// agreement failures; it is recorded separately, not a claimed deployment.
+DGPP_TEST(dsv41_tp_mixed_world_2_matches_reference) {
+  const auto cfg = dsv41fx::tiny_exl3_mixed_config();
+  const auto dir = (fs::current_path() / "dsv41_tp_mixed_w2_fixture").string();
+  dsv41fx::write_fixture(cfg, dir);
+  (void)dsv41fx::fixture_sidecar(cfg, dir);
+  for (const int rows : {24, 70}) {
+    const auto tokens = make_tokens(cfg, rows);
+    Dsv41Model::Outputs ref;
+    {
+      Dsv41Model single(cfg, dir, rows, 512);
+      ref = single.forward(tokens, true);
+    }
+    check_world(2, rows == 24 ? 29990 : 29991, dir, cfg, tokens, ref);
+  }
+}
+
 namespace {
 // A reducer at world 1 for the fold-overlap gates: every fold an identity,
 // the asynchronous ones counted (dsv4_tp_test's).

@@ -52,3 +52,15 @@ Bind the private API to loopback and retain the site's authenticated proxy.
 Temperature-zero comparisons use seed 42 and `reasoning_effort: "xhigh"`.
 Include sampled traffic, cached follow-ups and cancellation in focused checks.
 Full quality benchmarks belong to the operator after the candidate is ready.
+
+## Validation scope
+
+Initial GPU checks passed the dense EXL3 oracle and row-invariance tests,
+the mixed MoE oracle/prefill/decode/graph-table tests, and the EXL3 loader
+tests. The two-rank synthetic model comparisons pass the existing numerical
+budgets at 24 and 70 rows. A supplementary four-rank run of the mixed fixture
+fails the first-layer routing-agreement gate and, at 24 rows, the aggregate
+layer-local routing-flip limit. Its per-layer numerical errors remain within
+the tolerance. Those budgets were not loosened; the dedicated mixed-pack TP
+test covers the requested two-node deployment. Four-node support for this
+mixed pack is not validated by this candidate.

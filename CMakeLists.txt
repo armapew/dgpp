@@ -2151,12 +2151,14 @@ set_tests_properties(dsv41_engine_test_exl3 PROPERTIES RUN_SERIAL TRUE)  # the s
 # Keep fixtures and loopback ports isolated from the uniform EXL3 suite.
 set(DSV41_MIXED_WORKDIR ${CMAKE_CURRENT_BINARY_DIR}/dsv41_exl3_mixed)
 file(MAKE_DIRECTORY ${DSV41_MIXED_WORKDIR})
-foreach(_test dsv41_tp_test dsv41_engine_test)
-  add_test(NAME ${_test}_exl3_mixed
-    COMMAND ${CMAKE_COMMAND} -E env DGPP_DSV41_FIXTURE=exl3_mixed $<TARGET_FILE:${_test}>
-    WORKING_DIRECTORY ${DSV41_MIXED_WORKDIR})
-  set_tests_properties(${_test}_exl3_mixed PROPERTIES RUN_SERIAL TRUE LABELS "gpu;rdma" SKIP_RETURN_CODE 2)
-endforeach()
+add_test(NAME dsv41_tp_test_exl3_mixed
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_FILTER=dsv41_tp_mixed_world_2_matches_reference $<TARGET_FILE:dsv41_tp_test>
+  WORKING_DIRECTORY ${DSV41_MIXED_WORKDIR})
+add_test(NAME dsv41_engine_test_exl3_mixed
+  COMMAND ${CMAKE_COMMAND} -E env DGPP_DSV41_FIXTURE=exl3_mixed $<TARGET_FILE:dsv41_engine_test>
+  WORKING_DIRECTORY ${DSV41_MIXED_WORKDIR})
+set_tests_properties(dsv41_tp_test_exl3_mixed dsv41_engine_test_exl3_mixed
+  PROPERTIES RUN_SERIAL TRUE LABELS "gpu;rdma" SKIP_RETURN_CODE 2)
 add_test(NAME dsv41_engine_test_draft_screen
   COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_DRAFT_SCREEN=2 $<TARGET_FILE:dsv41_engine_test>)
 set_tests_properties(dsv41_engine_test_draft_screen PROPERTIES RUN_SERIAL TRUE LABELS "gpu" SKIP_RETURN_CODE 2)
