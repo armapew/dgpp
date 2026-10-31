@@ -12,6 +12,8 @@ mapping from the globals to the reference's call is the renderer's
 contract, written here once:
   * tools and response_format (the normalized schema) attach to the first
     system message, or to an empty system message inserted at the front;
+    a response_format object also adds the API's raw-JSON instruction to
+    that system content (even an empty schema still requests JSON);
   * enable_thinking false -> thinking_mode "chat", else "thinking";
   * clear_thinking -> drop_thinking (default true);
   * reasoning_effort: minimal 25, low 50, medium 62, high 75, max 100 (the
@@ -158,9 +160,14 @@ def to_reference(kwargs):
     messages = copy.deepcopy(kwargs["messages"])
     tools = kwargs.get("tools")
     schema = kwargs.get("response_format")
-    if tools or schema:
+    json_requested = isinstance(schema, dict)
+    if tools or json_requested:
         if messages[0].get("role") != "system":
             messages.insert(0, {"role": "system", "content": ""})
+        if json_requested:
+            messages[0]["content"] = (messages[0].get("content") or "") + (
+                "\n\nFor your final structured answer, output the JSON value directly. "
+                "Do not wrap it in Markdown code fences or add surrounding prose.")
         if tools:
             messages[0]["tools"] = tools
         if schema:

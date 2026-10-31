@@ -310,7 +310,7 @@ bool Dsv41Prompt::reads(std::string_view name) {
          name == "reasoning_effort";
 }
 
-uint64_t Dsv41Prompt::source_hash() { return 0x64737634312d3032ull; }  // "dsv41-02": native response-format block
+uint64_t Dsv41Prompt::source_hash() { return 0x64737634312d3033ull; }  // "dsv41-03": explicit raw-JSON output contract
 
 std::string Dsv41Prompt::render(const minijson::Value& globals) {
   if (!globals.is_object()) refuse("globals must be an object");
@@ -322,6 +322,7 @@ std::string Dsv41Prompt::render(const minijson::Value& globals) {
   const minijson::Value* response_format = globals.find("response_format");
   if (response_format && response_format->is_null()) response_format = nullptr;
   if (response_format && !response_format->is_object()) refuse("response_format must be a schema object");
+  const bool json_requested = response_format != nullptr;
   if (response_format && response_format->members().empty()) response_format = nullptr;
   bool thinking = true, drop_thinking = true;
   if (const minijson::Value* v = globals.find("enable_thinking"); v && v->is_bool()) thinking = v->as_bool();
@@ -371,7 +372,7 @@ std::string Dsv41Prompt::render(const minijson::Value& globals) {
   }
   // Tools and the schema ride the first system message, or an empty one
   // in front, in the reference encoder's order (tools before schema).
-  if (tools || response_format) {
+  if (tools || json_requested) {
     if (raw[0].role != "system") {
       Msg sys;
       sys.role = "system";
@@ -379,6 +380,13 @@ std::string Dsv41Prompt::render(const minijson::Value& globals) {
     }
     raw[0].tools = tools;
     raw[0].response_format = response_format;
+    // The schema alone does not distinguish raw JSON from a Markdown
+    // wrapper. In JSON-or-tools mode, masking a preferred fence can steer
+    // the model into an unnecessary call. State the API's output contract
+    // in the system content while keeping the native tools/schema order.
+    if (json_requested)
+      raw[0].content += "\n\nFor your final structured answer, output the JSON value directly. "
+                        "Do not wrap it in Markdown code fences or add surrounding prose.";
   }
 
   // ---- merge_tool_messages ------------------------------------------------------

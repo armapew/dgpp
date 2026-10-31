@@ -40,7 +40,8 @@ class Dsv41Prompt {
   // The service's globals: "messages" (the normalized OpenAI array; roles
   // system / user / assistant / tool), optional "tools" (the OpenAI
   // array), "response_format" (a schema object, appended after the tools
-  // in the first system message), "reasoning_effort" (a string or an integer), "clear_thinking"
+  // in the first system message, with raw-JSON guidance in system content),
+  // "reasoning_effort" (a string or an integer), "clear_thinking"
   // and "enable_thinking" (bools). Throws std::runtime_error naming the
   // offending field on anything the reference refuses (an unknown role,
   // image content, a namespace conflict).
