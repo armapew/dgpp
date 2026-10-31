@@ -39,7 +39,9 @@ it. Rank 0 serves metrics on its HTTP endpoint. See the
   `exl3-3.5bpw` for the EXL3 trellis re-pack of DeepSeek-V4.1-Flash-1017
   (every projection a 3–8-bit trellis-coded matrix under the pack's
   k-map, decoded by the engine's own kernels; the Engram tables read from
-  the base release through `engine.engram_source`). The
+  the base release through `engine.engram_source`), and `exl3-2.8bpw` for
+  the jayleaton pack's per-matrix 2/3/4/5/6/8-bit widths and native BF16/FP32
+  tensors, discovered from shard headers without a k-map. The
   JSON's `model` field gives the exact Hugging Face repository.
 - `w<n>` gives the participating node count. Nothing restricts that number to
   the counts in use today; a world is refused by the engine's geometry check or
@@ -47,7 +49,10 @@ it. Rank 0 serves metrics on its HTTP endpoint. See the
 
 Most templates enable MTP (the block draft on DeepSeek) at the depth the
 family measured best, with the decode graph, at the request-slot count and
-cache budget that measured at or above every other shape tried — except the
+cache budget that measured at or above every other shape tried. The
+[EXL3 2.8 bpw two-node candidate](../docs/model_cards/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw.md)
+instead uses a conservative initial allocation; its focused checks do not
+establish an optimal throughput profile. Other exceptions include the
 Qwen3.8-27B templates, which name `engine.dflash_model` instead of MTP: the
 external block drafter replacing the MTP draft (the block proposal
 recorded inside the graph step at every world; one Spark without the

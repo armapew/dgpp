@@ -35,10 +35,14 @@ The [two-node template](../../deploy/cluster_deepseek-v4.1-flash-1017_exl3-2.8bp
 uses four slots, a 1,048,576-token shared pool, 2,048-row prefill budgets,
 a 1 GiB prefix arena and fixed depth-5 DSpark verification. It deliberately
 does not reuse the four-node 3.5 bpw template's measured scheduling costs.
-This is a bring-up allocation, pending load and concurrent-prefill peak checks.
+The family allocates a 4,096-row forward workspace even with these 2,048-token
+per-tick caps. This is a conservative initial allocation, not a tuned throughput
+profile. The 1M pool is shared across requests; its API request ceiling does
+not mean that four independent 1M contexts fit.
 
 DeepSeek's existing DGPP cache formats remain FP4-block main compressed KV,
-FP8-block sliding windows and FP8 index keys. These differ from TensorFold's
+FP8-block sliding windows and indexer FP4 quantization stored as FP8 codes
+plus row scales. These differ from TensorFold's
 default FP8 split main cache; the same weight pack does not imply identical
 cache arithmetic or output. Keep that distinction in evaluation records.
 
@@ -52,10 +56,15 @@ Bind the private API to loopback and retain the site's authenticated proxy.
 Temperature-zero comparisons use seed 42 and `reasoning_effort: "xhigh"`.
 Include sampled traffic, cached follow-ups and cancellation in focused checks.
 Full quality benchmarks belong to the operator after the candidate is ready.
+The pack has no `generation_config.json`. To retain the selected ordinary
+sampling defaults, use the normal launcher with
+`--knobs '--temperature 1 --top-p 0.95 --top-k 20'`; each request can override
+them. Without those flags DGPP falls back to greedy defaults.
 
 ## Validation scope
 
-Initial GPU checks passed the dense EXL3 oracle and row-invariance tests,
+Build `038c897ad590`, based on upstream `92303ef9`, passed the dense EXL3
+oracle and row-invariance tests,
 the mixed MoE oracle/prefill/decode/graph-table tests, and the EXL3 loader
 tests. The two-rank synthetic model comparisons pass the existing numerical
 budgets at 24 and 70 rows. A supplementary four-rank run of the mixed fixture
@@ -64,3 +73,25 @@ layer-local routing-flip limit. Its per-layer numerical errors remain within
 the tolerance. Those budgets were not loosened; the dedicated mixed-pack TP
 test covers the requested two-node deployment. Four-node support for this
 mixed pack is not validated by this candidate.
+
+The actual checkpoint binding matched all 192,510 tensors, including the four
+external Engram tensors, with no missing tensors or dtype/shape mismatches.
+The token map and hash multipliers match the reference's prepared Engram
+asset. Physical two-node eager/graph collectives passed; bulk payload checks
+exercised both configured RoCE lanes. The existing uniform EXL3 two-/four-rank
+regression checks also passed.
+
+Focused serving checks on two GB10 nodes passed arithmetic, JSON, Python code,
+tool-call/result replay, retrieval at 19,854 and 99,854 prompt tokens, cached
+follow-ups, cold C1/C2/C4, cached C4, mixed temperature-zero/0.6 traffic and
+stream cancellation followed by successful slot reuse. The four-slot decode
+graph was exercised. All non-cancelled requests completed without truncation;
+the service reported no engine/request failures and both serving processes
+stayed at zero swap. The two ranks' operation streams matched byte-for-byte
+at clean shutdown. Restarting from all 43 resident-image layers reproduced the
+same greedy message, and strict JSON-schema output passed after restart.
+
+These are bounded correctness and deployment checks, not a full quality or
+performance campaign. Quality above roughly 100K context, maximum-pool C4,
+vision and Responses/client integration remain unvalidated. The operator's
+full text evaluation is the next acceptance gate.
