@@ -29,15 +29,19 @@ branch into the existing per-width arithmetic. Uniform packs retain their
 specialized width-pair paths. Prefill, decode, graph tables and TP slices
 must all pass the mixed-width fixtures before serving this candidate.
 
-## Initial profile
+## Serving profile
 
 The [two-node template](../../deploy/cluster_deepseek-v4.1-flash-1017_exl3-2.8bpw_w2.example.json)
 uses four slots, a 1,048,576-token shared pool, 2,048-row prefill budgets,
-a 1 GiB prefix arena and fixed depth-5 DSpark verification. It deliberately
-does not reuse the four-node 3.5 bpw template's measured scheduling costs.
+a 1 GiB prefix arena and confidence-scheduled DSpark verification at depths
+1, 3 and 5. Its cost model uses a 28.5 ms base plus 4.7 ms per verify row,
+seeded from two-node step measurements; the multiplier adapts and sampled
+requests use the existing 0.93 acceptance scale. These are deployment-specific
+prices, not the four-node 3.5 bpw template's costs. The prefix creation floor
+is 256 tokens; cache capacity and 128-token snapshot alignment are unchanged.
 The family allocates a 4,096-row forward workspace even with these 2,048-token
-per-tick caps. This is a conservative initial allocation, not a tuned throughput
-profile. The 1M pool is shared across requests; its API request ceiling does
+per-tick caps. Snapshot/pool allocations remain conservative. The 1M pool is
+shared across requests; its API request ceiling does
 not mean that four independent 1M contexts fit.
 
 DeepSeek's existing DGPP cache formats remain FP4-block main compressed KV,
@@ -126,8 +130,34 @@ and general quality parity are not established.
 A remaining JSON/tool interaction was isolated with an identical native prompt:
 the constrained Chat Completions path emits a calculator call, while the
 unconstrained continuation has identical reasoning followed by fenced JSON.
-The native render matches the reference byte-for-byte. Handling the preferred
-wrapper without redirecting an answer into a tool call remains serving work;
-do not disable structured-output validation or alter the evaluator as a remedy.
-Fixed depth-5 verification, prefill and prefix-cache behavior remain separate
-optimization candidates requiring measured validation on this mixed pack.
+The native render matches the reference byte-for-byte. This motivated the raw
+JSON clarification below; structured-output validation and the evaluator remain
+unchanged.
+The subsequent serving/profile changes are recorded below.
+
+## Raw JSON and adaptive verification
+
+Build `3b3f4bc497f3` makes the raw-JSON contract explicit in system content
+whenever a response schema is requested. This avoids the reproduced fence/tool
+conflict without weakening the grammar, adding output rewriting or changing
+ordinary chat prompts. The renderer revision is bumped; 20 original and four
+schema prompt fixtures match the reference encoder with that API instruction.
+
+The operator's evaluator subset, unchanged at T0/seed 42/xhigh/C3, passes
+TC-45/64/65/66/67/69; TC-68 remains partial for an unnecessary search. The
+required-tool capability probe succeeds in 40 tokens with valid arguments.
+The full benchmark is still the operator's acceptance gate for this build.
+
+The selected confidence schedule reproduced four baseline capped greedy
+transcripts exactly in C1/C3 checks. C2 and C4 mixed-temperature checks,
+sampled named tools and JSON streaming, cancellation/slot reuse, 20K/100K
+retrieval and cache reuse also passed. A lower prefix floor improves repeated
+short requests but adds snapshot work to their first cold request. The one-GiB
+arena was retained. Both serving processes remained at zero swap in the
+focused validation. These checks do not establish universal numerical or
+quality parity across batching shapes, histories or sampling seeds.
+
+A rank-0 prefill profile remains dominated by EXL3, attention and collective
+work. An idle 4K chunk trial showed only a small one-pass gain; the selected
+profile retains 2K busy/idle caps. No kernel arithmetic, quantization, expert
+routing, KV precision, model weights or sampling defaults changed.
