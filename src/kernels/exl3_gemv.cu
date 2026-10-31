@@ -80,7 +80,7 @@ struct Core {
   // critical path at every window; the plan's §7 record).
   __device__ static void run(uint8_t* smem, const uint16_t* __restrict__ xh, size_t xh_stride, int rows,
                              const uint8_t* __restrict__ tiles_block, size_t n_tile_bytes, int win0, int win1,
-                             float (&c)[kMT][2][4]) {
+                             float (&c)[kMT][2][4], int /*actual_bits*/ = kBits) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const uint8_t* wtiles = tiles_block + static_cast<size_t>(warp) * n_tile_bytes;
 #pragma unroll
@@ -168,6 +168,29 @@ struct Core {
       store_out(o + 1, v1);
       store_out(o + 2, v2);
       store_out(o + 3, v3);
+    }
+  }
+};
+
+// Mixed packs carry the width in each expert view. All threads of this CTA
+// read the same matrix, so the branch is uniform and retains the exact core
+// for that width (including its accumulation order and staging depth).
+template <int kMT, int kStageCap>
+struct Core<0, kMT, kStageCap> : Core<8, kMT, kStageCap> {
+  static constexpr size_t kSmemBytes = kSmemBudget;
+  __device__ static void run(uint8_t* smem, const uint16_t* xh, size_t stride, int rows,
+                             const uint8_t* tiles, size_t ntb, int win0, int win1,
+                             float (&c)[kMT][2][4], int bits) {
+    switch (bits) {
+#define DGPP_EXL3_CORE(B) case B: Core<B, kMT, kStageCap>::run(smem, xh, stride, rows, tiles, ntb, win0, win1, c); return
+      DGPP_EXL3_CORE(2);
+      DGPP_EXL3_CORE(3);
+      DGPP_EXL3_CORE(4);
+      DGPP_EXL3_CORE(5);
+      DGPP_EXL3_CORE(6);
+      DGPP_EXL3_CORE(8);
+#undef DGPP_EXL3_CORE
+      default: __trap();
     }
   }
 };
@@ -365,15 +388,17 @@ void launch(const uint16_t* act, size_t act_stride, const Exl3Matrix& w, OutT* o
             size_t out_stride, cudaStream_t stream, void* ws, size_t ws_bytes) {
   if (!exl3_gemm_shape_ok(w, act, act_stride, m, n, k))
     throw std::invalid_argument("exl3_gemm: shape or alignment outside the contract (n == rows, k == cols, "
-                                "multiples of 128; 16-byte aligned act / tiles; bits 3, 4, 6 or 8)");
+                                "multiples of 128; 16-byte aligned act / tiles; bits 2, 3, 4, 5, 6 or 8)");
   if (out_stride == 0) out_stride = static_cast<size_t>(n);
   if (out_stride < static_cast<size_t>(n)) throw std::invalid_argument("exl3_gemm: out stride");
   if (ws == nullptr || ws_bytes < exl3_gemm_ws_bytes(n, k, 1) || (reinterpret_cast<uintptr_t>(ws) & 15u) != 0)
     throw std::invalid_argument("exl3_gemm: a 16-byte aligned workspace of exl3_gemm_ws_bytes(n, k, splits) is required");
   const int splits = exl3_gemm_splits(n, k, ws, ws_bytes);
   switch (w.bits) {
+    case 2: launch_bits<2, OutT>(act, act_stride, w, out, m, n, k, out_stride, splits, ws, stream); break;
     case 3: launch_bits<3, OutT>(act, act_stride, w, out, m, n, k, out_stride, splits, ws, stream); break;
     case 4: launch_bits<4, OutT>(act, act_stride, w, out, m, n, k, out_stride, splits, ws, stream); break;
+    case 5: launch_bits<5, OutT>(act, act_stride, w, out, m, n, k, out_stride, splits, ws, stream); break;
     case 6: launch_bits<6, OutT>(act, act_stride, w, out, m, n, k, out_stride, splits, ws, stream); break;
     case 8: launch_bits<8, OutT>(act, act_stride, w, out, m, n, k, out_stride, splits, ws, stream); break;
     default: throw std::invalid_argument("exl3_gemm: bit width not compiled");
@@ -493,13 +518,13 @@ __global__ __launch_bounds__(kThreads) void exl3_moe_slot_gate_up_kernel(
   const uint16_t* au = xh_u + static_cast<size_t>(p) * xh_stride;
   float cg[kMT][2][4], cu[kMT][2][4];
   if (shared) {
-    const size_t ntb = static_cast<size_t>(k / kExl3Tile) * CS::kTileBytes;
-    CS::run(smem, ag, xh_stride, L, vg.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, cg);
-    CS::run(smem, au, xh_stride, L, vu.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, cu);
+    const size_t ntb = static_cast<size_t>(k / kExl3Tile) * 32 * (kSBits == 0 ? vg.exl3_bits : kSBits);
+    CS::run(smem, ag, xh_stride, L, vg.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, cg, vg.exl3_bits);
+    CS::run(smem, au, xh_stride, L, vu.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, cu, vu.exl3_bits);
   } else {
-    const size_t ntb = static_cast<size_t>(k / kExl3Tile) * CR::kTileBytes;
-    CR::run(smem, ag, xh_stride, L, vg.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, cg);
-    CR::run(smem, au, xh_stride, L, vu.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, cu);
+    const size_t ntb = static_cast<size_t>(k / kExl3Tile) * 32 * (kRBits == 0 ? vg.exl3_bits : kRBits);
+    CR::run(smem, ag, xh_stride, L, vg.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, cg, vg.exl3_bits);
+    CR::run(smem, au, xh_stride, L, vu.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, cu, vu.exl3_bits);
   }
   // The two [kRows][128] tiles in the stages (free after run): the gate's
   // then the up's.
@@ -564,12 +589,12 @@ __global__ __launch_bounds__(kThreads) void exl3_moe_slot_down_kernel(
   float c[kMT][2][4];
   float* sC = reinterpret_cast<float*>(smem);
   if (shared) {
-    const size_t ntb = static_cast<size_t>(k / kExl3Tile) * CS::kTileBytes;
-    CS::run(smem, a, xh_stride, L, v.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, c);
+    const size_t ntb = static_cast<size_t>(k / kExl3Tile) * 32 * (kSBits == 0 ? v.exl3_bits : kSBits);
+    CS::run(smem, a, xh_stride, L, v.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, c, v.exl3_bits);
     CS::fragments_to_smem(sC, c);
   } else {
-    const size_t ntb = static_cast<size_t>(k / kExl3Tile) * CR::kTileBytes;
-    CR::run(smem, a, xh_stride, L, v.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, c);
+    const size_t ntb = static_cast<size_t>(k / kExl3Tile) * 32 * (kRBits == 0 ? v.exl3_bits : kRBits);
+    CR::run(smem, a, xh_stride, L, v.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0, nwin, c, v.exl3_bits);
     CR::fragments_to_smem(sC, c);
   }
   __syncthreads();
@@ -643,11 +668,11 @@ __global__ __launch_bounds__(kThreads) void exl3_moe_grouped_kernel(const uint16
   // The segment's own K: the launch's k is the widest matrix's, and the
   // down projection's inter slice varies by expert (exl3_expert_block_split).
   const int kk = static_cast<int>(v.exl3_cols) < k ? static_cast<int>(v.exl3_cols) : k;
-  const size_t ntb = static_cast<size_t>(kk / kExl3Tile) * C::kTileBytes;
+  const size_t ntb = static_cast<size_t>(kk / kExl3Tile) * 32 * (kBits == 0 ? v.exl3_bits : kBits);
   const size_t grow = static_cast<size_t>(seg.row0) + row0;
   float c[4][2][4];
   C::run(smem, xh + grow * xh_stride, xh_stride, rows, v.payload + static_cast<size_t>(n0 / kExl3Tile) * ntb, ntb, 0,
-         kk / kWindowK, c);
+         kk / kWindowK, c, v.exl3_bits);
   float* sC = reinterpret_cast<float*>(smem);
   C::fragments_to_smem(sC, c);
   __syncthreads();
@@ -733,6 +758,8 @@ void dispatch_pair(int rb, int sb, F&& f) {
   if (rb == 4 && sb == 4) return f(std::integral_constant<int, 4>{}, std::integral_constant<int, 4>{});
   if (rb == 8 && sb == 8) return f(std::integral_constant<int, 8>{}, std::integral_constant<int, 8>{});
   if (rb == 4 && sb == 8) return f(std::integral_constant<int, 4>{}, std::integral_constant<int, 8>{});
+  if ((rb == 0 || exl3_gpu_bits_ok(rb)) && (sb == 0 || exl3_gpu_bits_ok(sb)))
+    return f(std::integral_constant<int, 0>{}, std::integral_constant<int, 0>{});
   throw std::invalid_argument("exl3 moe: the (routed, shared) width pair " + std::to_string(rb) + "/" +
                               std::to_string(sb) + " is not compiled");
 }
@@ -763,8 +790,11 @@ void launch_grouped_bits(int bits, const uint16_t* xh, size_t xh_stride, const M
       (xh_stride * 2) % 16 != 0 || out_stride < static_cast<size_t>(n))
     throw std::invalid_argument("exl3_moe_grouped: shape outside the contract");
   switch (bits) {
+    case 0: launch_grouped<0, OutT>(xh, xh_stride, segs, n_segs, max_rows, views, which, out, out_stride, n, k, stream); break;
+    case 2: launch_grouped<2, OutT>(xh, xh_stride, segs, n_segs, max_rows, views, which, out, out_stride, n, k, stream); break;
     case 3: launch_grouped<3, OutT>(xh, xh_stride, segs, n_segs, max_rows, views, which, out, out_stride, n, k, stream); break;
     case 4: launch_grouped<4, OutT>(xh, xh_stride, segs, n_segs, max_rows, views, which, out, out_stride, n, k, stream); break;
+    case 5: launch_grouped<5, OutT>(xh, xh_stride, segs, n_segs, max_rows, views, which, out, out_stride, n, k, stream); break;
     case 6: launch_grouped<6, OutT>(xh, xh_stride, segs, n_segs, max_rows, views, which, out, out_stride, n, k, stream); break;
     case 8: launch_grouped<8, OutT>(xh, xh_stride, segs, n_segs, max_rows, views, which, out, out_stride, n, k, stream); break;
     default: throw std::invalid_argument("exl3_moe_grouped: bit width not compiled");
@@ -776,7 +806,7 @@ void launch_grouped_bits(int bits, const uint16_t* xh, size_t xh_stride, const M
 bool exl3_gemm_shape_ok(const Exl3Matrix& w, const void* act, size_t act_stride, int m, int n, int k) {
   if (m < 1 || n <= 0 || k <= 0 || w.rows != n || w.cols != k) return false;
   if (n % kExl3Block != 0 || k % kExl3Block != 0) return false;
-  if (w.bits != 3 && w.bits != 4 && w.bits != 6 && w.bits != 8) return false;
+  if (!exl3_gpu_bits_ok(w.bits)) return false;
   if (w.tiles == nullptr || w.suh == nullptr || w.svh == nullptr || act == nullptr) return false;
   if ((reinterpret_cast<uintptr_t>(w.tiles) & 15u) != 0 || (reinterpret_cast<uintptr_t>(act) & 15u) != 0) return false;
   if ((act_stride * 2) % 16 != 0) return false;

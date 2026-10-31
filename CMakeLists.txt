@@ -2147,6 +2147,16 @@ dgpp_set_common(dsv41_engine_test)
 add_test(NAME dsv41_engine_test COMMAND dsv41_engine_test)
 add_test(NAME dsv41_engine_test_exl3 COMMAND ${DSV41_EXL3_ENV} $<TARGET_FILE:dsv41_engine_test> WORKING_DIRECTORY ${DSV41_EXL3_WORKDIR})
 set_tests_properties(dsv41_engine_test_exl3 PROPERTIES RUN_SERIAL TRUE)  # the same loopback ports as dsv41_engine_test
+# The 2.8 bpw pack mixes expert/projection widths and keeps BF16/F32 natives.
+# Keep fixtures and loopback ports isolated from the uniform EXL3 suite.
+set(DSV41_MIXED_WORKDIR ${CMAKE_CURRENT_BINARY_DIR}/dsv41_exl3_mixed)
+file(MAKE_DIRECTORY ${DSV41_MIXED_WORKDIR})
+foreach(_test dsv41_tp_test dsv41_engine_test)
+  add_test(NAME ${_test}_exl3_mixed
+    COMMAND ${CMAKE_COMMAND} -E env DGPP_DSV41_FIXTURE=exl3_mixed $<TARGET_FILE:${_test}>
+    WORKING_DIRECTORY ${DSV41_MIXED_WORKDIR})
+  set_tests_properties(${_test}_exl3_mixed PROPERTIES RUN_SERIAL TRUE LABELS "gpu;rdma" SKIP_RETURN_CODE 2)
+endforeach()
 add_test(NAME dsv41_engine_test_draft_screen
   COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_DRAFT_SCREEN=2 $<TARGET_FILE:dsv41_engine_test>)
 set_tests_properties(dsv41_engine_test_draft_screen PROPERTIES RUN_SERIAL TRUE LABELS "gpu" SKIP_RETURN_CODE 2)

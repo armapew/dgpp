@@ -31,6 +31,14 @@ MoeExpertView routed_view(const GlmMoeWeights& w, size_t i) {
   if (w.packq()) return MoeExpertView::of(w.experts_packed[i]);
   return MoeExpertView::of(w.experts[i]);
 }
+// Zero selects the per-view CUDA dispatch. Existing uniform packs retain
+// their specialized kernels; gate/up and down can have different widths.
+int exl3_routed_bits(const GlmMoeWeights& w, int experts, int which) {
+  const int bits = w.experts_exl3[which].bits;
+  for (int e = 1; e < experts; ++e)
+    if (w.experts_exl3[static_cast<size_t>(e) * 3 + which].bits != bits) return 0;
+  return bits;
+}
 // The routed inter slice: expert 0's gate rows in whichever table holds it
 // — under EXL3 the widest expert's (the slices alternate by parity:
 // exl3_expert_block_split), the buffers' width.
@@ -440,15 +448,15 @@ void GlmMoeLayer::check_expert_geometry() const {
       throw std::runtime_error("GlmMoeLayer: EXL3 experts bound beside another routed table");
     // Each expert's slice is its own (the TP slices alternate by parity,
     // exl3_expert_block_split): gate rows == up rows == down cols, whole
-    // 128-blocks within cfg.inter (the widest); one width across the table.
-    const Exl3Matrix& g0 = w_.experts_exl3[0];
+    // 128-blocks within cfg.inter (the widest). Gate/up share a width per
+    // expert; the down projection and other experts may use other widths.
     if (H % kExl3Block != 0) throw std::runtime_error("GlmMoeLayer: the EXL3 hidden size must be a multiple of 128");
     for (int e = 0; e < E; ++e) {
       const Exl3Matrix* m = w_.experts_exl3 + static_cast<size_t>(e) * 3;
       if (m[0].rows <= 0 || m[0].rows % kExl3Block != 0 || m[0].rows > cfg_.inter || m[0].cols != H ||
           m[1].cols != H || m[1].rows != m[0].rows || m[2].rows != H || m[2].cols != m[0].rows || !m[0].tiles ||
           !m[1].tiles || !m[2].tiles || !m[0].suh || !m[1].suh || !m[2].suh || !m[0].svh || !m[1].svh ||
-          !m[2].svh || m[0].bits != g0.bits || m[1].bits != g0.bits || m[2].bits != g0.bits)
+          !m[2].svh || m[0].bits != m[1].bits || !exl3_gpu_bits_ok(m[0].bits) || !exl3_gpu_bits_ok(m[2].bits))
         throw std::runtime_error("GlmMoeLayer: inconsistent EXL3 routed expert matrices (expert " +
                                  std::to_string(e) + ")");
     }
@@ -458,7 +466,7 @@ void GlmMoeLayer::check_expert_geometry() const {
       const Exl3Matrix* sh = w_.shared_exl3;
       if (sh[0].cols != H || sh[1].cols != H || sh[0].rows != sh[1].rows || sh[2].rows != H ||
           sh[2].cols != sh[0].rows || sh[0].rows % kExl3Block != 0 || sh[0].rows > cfg_.inter ||
-          sh[0].bits != sh[1].bits || sh[2].bits != sh[0].bits)
+          sh[0].bits != sh[1].bits || !exl3_gpu_bits_ok(sh[0].bits) || !exl3_gpu_bits_ok(sh[2].bits))
         throw std::runtime_error("GlmMoeLayer: inconsistent EXL3 shared expert matrices");
     }
     return;
@@ -1168,7 +1176,9 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     const bool fp4_w = routed_arg ? w_.fp4_of(which) : shared_fp4;
     if (exl3)
       launch_exl3_moe_grouped_bf16(which == 0 ? d_xh_g_ : d_xh_u_, static_cast<size_t>(H), sg, ns, mr,
-                                   d_views_prefill_, which, routed_arg ? routed_bits : shared_bits, out, I_max, n, H,
+                                   d_views_prefill_, which,
+                                   routed_arg ? exl3_routed_bits(w_, cfg_.n_experts, which) : w_.shared_exl3[which].bits,
+                                   out, I_max, n, H,
                                    stream);
     else if (packq && mma && a8 && routed_arg)
       launch_moe_grouped_mma_packq_bf16(hidden, H, sg, ns, mr, d_views_prefill_, which, out, I_max, n, H, 0, stream,
@@ -1212,7 +1222,8 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
       launch_exl3_moe_rotate_segments(d_act_, I_max, sg, ns, mr, d_views_prefill_, 2, k, d_xh_d_, nullptr, I_max,
                                       stream);
       launch_exl3_moe_grouped_f32(d_xh_d_, I_max, sg, ns, mr, d_views_prefill_, 2,
-                                  routed_arg ? routed_bits : shared_bits, d_down_, H, H, k, stream);
+                                  routed_arg ? exl3_routed_bits(w_, cfg_.n_experts, 2) : w_.shared_exl3[2].bits,
+                                  d_down_, H, H, k, stream);
     } else if (packq && mma && a8 && routed_arg && down_bf16_)
       launch_moe_grouped_mma_packq_bf16(d_act_, I_max, sg, ns, mr, d_views_prefill_, 2,
                                         reinterpret_cast<uint16_t*>(d_down_), H, H, k, 0, stream, nullptr,
@@ -1549,8 +1560,10 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
     // widths. The rotation copies are the layer's (d_xh_*), sized for the
     // decode slots. (Rotating inside the slot kernels' stages instead was
     // measured 2026-10-23: 30-50 % slower kernels; the plan's §7.)
-    const int rb = w_.experts_exl3[0].bits;
+    const int rb = exl3_routed_bits(w_, E, 0);
     const int sb = slot_shared ? w_.shared_exl3[0].bits : rb;
+    const int db = exl3_routed_bits(w_, E, 2);
+    const int dsb = slot_shared ? w_.shared_exl3[2].bits : db;
     const int I_x = std::max(I_r, I_s);
     launch_exl3_moe_rotate_slots(hidden, static_cast<size_t>(H), d_ids_, order, table, slots, K, H, E * 3, I_s, 0,
                                  d_xh_g_, d_xh_u_, static_cast<size_t>(H), stream);
@@ -1559,7 +1572,7 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
                                         cfg_.swiglu_limit, E * 3, I_s, stream);
     launch_exl3_moe_rotate_slots(d_slot_act_, static_cast<size_t>(cfg_.inter), d_ids_, order, table, slots, K, I_x,
                                  E * 3, I_s, 2, d_xh_d_, nullptr, static_cast<size_t>(cfg_.inter), stream);
-    launch_exl3_moe_slot_down(d_xh_d_, static_cast<size_t>(cfg_.inter), d_ids_, order, runs, table, H, rb, sb,
+    launch_exl3_moe_slot_down(d_xh_d_, static_cast<size_t>(cfg_.inter), d_ids_, order, runs, table, H, db, dsb,
                               d_slot_down_, H, slots, K, E * 3, I_s, stream);
   } else if (packq) {
     // The packed table: the shared expert (int8) is view-table entry E,

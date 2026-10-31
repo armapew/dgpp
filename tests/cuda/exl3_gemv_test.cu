@@ -35,6 +35,8 @@ struct Shape {
   const char* what;
 };
 const Shape kShapes[] = {
+    {1152, 5120, 2, "q28 expert gate TP2"}, {5120, 1152, 5, "q28 expert down TP2"},
+    {1024, 4096, 5, "q28 wo_a group"},
     {1280, 5120, 6, "wq_a"},          {512, 5120, 6, "wkv"},          {8192, 1280, 6, "wq_b slice"},
     {5120, 2048, 6, "wo_b slice"},    {1024, 4096, 6, "wo_a group"},   {4096, 1280, 6, "indexer wq_b"},
     {640, 5120, 4, "expert gate 640"}, {5120, 640, 4, "expert down 640"}, {512, 5120, 3, "expert gate 512 (3b)"},
@@ -204,7 +206,7 @@ void test_contract() {
   require(!dgpp::exl3_gemm_shape_ok(w, dact, 264, 1, 128, 256), "n != rows is refused");
   require(!dgpp::exl3_gemm_shape_ok(w, dact, 263, 1, 256, 256), "an odd-16-byte stride is refused");
   Exl3Matrix bad = w;
-  bad.bits = 5;
+  bad.bits = 7;
   require(!dgpp::exl3_gemm_shape_ok(bad, dact, 264, 1, 256, 256), "an uncompiled width is refused");
   void* ws = nullptr;
   DGPP_CUDA_OK(cudaMalloc(&ws, dgpp::exl3_gemm_ws_bytes(256, 256, 16)));

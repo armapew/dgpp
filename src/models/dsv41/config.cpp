@@ -9,6 +9,8 @@
 #include <format>
 #include <stdexcept>
 
+#include "loaders/safetensors.hpp"
+
 namespace dgpp {
 namespace {
 
@@ -234,6 +236,33 @@ void parse_exl3_k_map(const minijson::Value* km, Dsv41TextConfig& c) {
   for (const auto& [name, b] : {std::pair{"attn_default", c.exl3.attn}, std::pair{"indexer_wk_bits", c.exl3.indexer_wk},
                                 std::pair{"head_bits", c.exl3.head}, std::pair{"mtp_bits", c.exl3.mtp}})
     if (!bits_ok(b)) reject(std::string("exl3_k_map.") + name, "the width must be an integer 1..8");
+}
+
+void parse_exl3_headers(const Dsv41TensorMap& headers, Dsv41TextConfig& c) {
+  c.exl3.per_matrix = true;
+  // These class defaults are used only while constructing the architecture's
+  // expected names/shapes. Binding replaces every matrix width from the map
+  // and refuses a missing matrix rather than falling back to a class width.
+  c.exl3.routed.assign(c.num_hidden_layers, 6);
+  c.exl3.shared.assign(c.num_hidden_layers, 6);
+  c.exl3.engram.assign(c.engram_layer_ids.size(), 6);
+  for (const auto& [name, t] : headers) {
+    if (name.ends_with(".trellis")) {
+      if (t.dtype != DType::I16 || t.shape.size() != 3 || t.shape[2] % 16 != 0 ||
+          t.shape[2] < 16 || t.shape[2] > 128)
+        reject(name, "EXL3 trellis must be I16 [K/16, N/16, 16 * bits], bits 1..8");
+      c.exl3.matrix_bits.emplace(name.substr(0, name.size() - 8), static_cast<int>(t.shape[2] / 16));
+    } else if (!name.ends_with(".suh") && !name.ends_with(".svh") && !name.ends_with(".mul1")) {
+      c.exl3.native_dtypes.emplace(name, t.dtype);
+    }
+  }
+  const auto head = c.exl3.matrix_bits.find("head");
+  if (head == c.exl3.matrix_bits.end()) reject("head.trellis", "missing from EXL3 checkpoint headers");
+  c.exl3.head = head->second;
+}
+
+void check_exl3_geometry(const Dsv41TextConfig& c) {
+  if (!c.weights_exl3) return;
   // The rotation block: every matrix axis a multiple of 128 (the plan's §2.3).
   auto block = [&](const char* what, int64_t v) {
     if (v % 128 != 0) reject(what, std::format("{} must be a multiple of 128 under the EXL3 format (the rotation block)", v));
@@ -271,7 +300,8 @@ void parse_vision(const minijson::Value& root, Dsv41TextConfig& c) {
 
 }  // namespace
 
-Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root, const minijson::Value* exl3_k_map) {
+Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root, const minijson::Value* exl3_k_map,
+                                     const Dsv41TensorMap* exl3_headers) {
   if (!root.is_object()) reject("", "root is not an object");
   Dsv41TextConfig c;
   const std::string model_type = optional_string(root, "model_type", "deepseek_v41");
@@ -503,7 +533,11 @@ Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root, const minijs
   }
 
   parse_quantization(root, c);
-  parse_exl3_k_map(exl3_k_map, c);
+  if (c.weights_exl3 && exl3_k_map == nullptr && exl3_headers != nullptr)
+    parse_exl3_headers(*exl3_headers, c);
+  else
+    parse_exl3_k_map(exl3_k_map, c);
+  check_exl3_geometry(c);
   parse_vision(root, c);
   return c;
 }
@@ -515,9 +549,22 @@ Dsv41TextConfig Dsv41TextConfig::from_json_file(const std::string& path) {
   const minijson::Value* qc = parsed.root.find("quantization_config");
   if (qc && qc->is_object() && optional_string(*qc, "quant_method", "") == "exl3") {
     const std::filesystem::path km = std::filesystem::path(path).parent_path() / "exl3_k_map.json";
-    if (!std::filesystem::exists(km))
-      reject("exl3_k_map.json", "an EXL3 pack needs its exl3_k_map.json beside config.json (missing from " +
-                                    km.parent_path().string() + ")");
+    if (!std::filesystem::exists(km)) {
+      Dsv41TensorMap headers;
+      std::vector<std::filesystem::path> paths;
+      for (const auto& entry : std::filesystem::directory_iterator(km.parent_path()))
+        if (entry.path().extension() == ".safetensors") paths.push_back(entry.path());
+      std::sort(paths.begin(), paths.end());
+      if (paths.empty()) reject("exl3_k_map.json", "no k-map or safetensors headers beside config.json");
+      for (const auto& shard : paths) {
+        const auto f = SafetensorsFile::open(shard.string());
+        f->for_each([&](const TensorInfo& t) {
+          if (!headers.emplace(t.name, Dsv41TensorDesc{t.dtype, t.shape}).second)
+            reject(t.name, "duplicate tensor in EXL3 checkpoint headers");
+        });
+      }
+      return parse(parsed.root, nullptr, &headers);
+    }
     // The parsed values view the JSON text: keep it alive through parse()
     // (a temporary here left every k-map string dangling on the real pack).
     const std::string kjson = read_file(km.string());

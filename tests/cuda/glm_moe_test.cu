@@ -596,7 +596,10 @@ SmallCase make_small_case(int E, int H, int I, int K, int tokens,
     c.cfg.exl3_experts = true;
     for (int m = 0; m < (E + 1) * 3; ++m) {
       const bool down = m % 3 == 2;
-      const int bits = m < E * 3 ? exl3_bits_routed : exl3_bits_shared;
+      // -1 exercises the seven gate/up/down patterns in the real 2.8 pack.
+      constexpr int mixed[7][3] = {{2,2,2}, {2,2,3}, {3,3,3}, {3,3,4}, {4,4,4}, {4,4,5}, {5,5,5}};
+      const int bits = m < E * 3 ? (exl3_bits_routed < 0 ? mixed[(m / 3) % 7][m % 3] : exl3_bits_routed)
+                                 : exl3_bits_shared;
       c.host_w.exl3.push_back(dgpp::exl3_random_matrix(rng, down ? H : I, down ? I : H, bits, 0.03f, 1.0f));
     }
   }
@@ -3138,7 +3141,8 @@ DGPP_TEST(moe_sliced_ranks_fold_matches_unsliced_oracle_packq) {
 DGPP_TEST(moe_exl3_expert_path_matches_oracle) {
   struct Case { int E, H, I, K, M, rb, sb; };
   const Case cases[] = {{8, 512, 256, 2, 1, 4, 6}, {8, 512, 256, 2, 5, 3, 6}, {8, 512, 256, 2, 12, 6, 6},
-                        {8, 512, 640, 2, 3, 4, 6}, {4, 256, 128, 2, 7, 8, 8}};
+                        {8, 512, 640, 2, 3, 4, 6}, {4, 256, 128, 2, 7, 8, 8},
+                        {8, 512, 256, 3, 7, -1, 5}};
   for (const Case& cs : cases) {
     SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M, 0xE713 + cs.M + cs.rb, false, false, 0, 16, 0, 0,
                                   nullptr, -1, cs.rb, cs.sb);
@@ -3161,7 +3165,9 @@ DGPP_TEST(moe_exl3_decode_slot_path_is_bitwise_host_path) {
   struct Case { int E, H, I, K, M, rb, sb; };
   const Case cases[] = {{8, 512, 256, 2, 1, 4, 6},  {8, 512, 256, 2, 3, 3, 6},  {8, 512, 640, 4, 2, 6, 6},
                         {8, 512, 256, 2, 17, 4, 6}, {8, 512, 640, 4, 40, 3, 6}, {4, 256, 128, 2, 64, 8, 8},
-                        {8, 512, 256, 2, 64, 6, 6}, {4, 256, 128, 2, 80, 4, 6},  {8, 512, 256, 2, 96, 3, 6}};
+                        {8, 512, 256, 2, 64, 6, 6}, {4, 256, 128, 2, 80, 4, 6}, {8, 512, 256, 2, 96, 3, 6},
+                        {8, 512, 256, 3, 1, -1, 5}, {8, 512, 640, 3, 17, -1, 6},
+                        {8, 512, 256, 3, 64, -1, 5}};
   for (const Case& cs : cases) {
     SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M, 0xE7D0 + cs.M + cs.rb, false, false, 0, 16, 0, 0,
                                   nullptr, -1, cs.rb, cs.sb);
@@ -3206,7 +3212,8 @@ DGPP_TEST(moe_exl3_sliced_ranks_fold_matches_unsliced_oracle) {
   struct Case { int E, H, I, K, M, world, rb, sb; };
   const Case cases[] = {{8, 512, 640, 2, 3, 4, 4, 6},   // 2/1/1/1 blocks: the uneven split
                         {8, 512, 640, 2, 2, 2, 3, 6},   // 3/2 blocks
-                        {8, 512, 256, 2, 4, 2, 6, 6}};  // even
+                        {8, 512, 256, 2, 4, 2, 6, 6},  // even
+                        {8, 512, 640, 3, 3, 2, -1, 5}};
   for (const Case& cs : cases) {
     SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M, 0xE75C + cs.world + cs.rb, false, false, 0, 16, 0, 0,
                                   nullptr, -1, cs.rb, cs.sb);

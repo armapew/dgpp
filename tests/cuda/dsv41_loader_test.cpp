@@ -842,23 +842,20 @@ DGPP_TEST(dsv41_loader_exl3_engram_tables_from_the_source_directory) {
   Dsv41LayerStream::set_engram_source_dir("");
 }
 
-DGPP_TEST(dsv41_loader_exl3_refuses_inexact_natives_and_a_pack_without_its_k_map) {
+DGPP_TEST(dsv41_loader_exl3_refuses_inexact_natives_and_reads_headers_without_k_map) {
   Fixture fx = write_exl3_fixture("dsv41_loader_exl3_refusal_fixture");
   // The k-map beside config.json is what the file form reads.
   const Dsv41TextConfig from_file = Dsv41TextConfig::from_json_file((fs::path(fx.dir) / "config.json").string());
   require(from_file.weights_exl3 && from_file.exl3.routed == fx.cfg.exl3.routed && from_file.exl3.head == 6,
           "exl3: from_json_file reads the k-map");
   fs::remove(fs::path(fx.dir) / "exl3_k_map.json");
-  bool refused = false;
-  try {
-    (void)Dsv41TextConfig::from_json_file((fs::path(fx.dir) / "config.json").string());
-  } catch (const std::exception& e) {
-    refused = std::string(e.what()).find("exl3_k_map") != std::string::npos;
-  }
-  require(refused, "exl3: a pack without its k-map is refused naming it");
+  const auto inferred = Dsv41TextConfig::from_json_file((fs::path(fx.dir) / "config.json").string());
+  require(inferred.exl3.per_matrix && inferred.exl3.matrix_bits.at("layers.0.ffn.experts.0.w1") == 4 &&
+          inferred.exl3.matrix_bits.at("layers.7.ffn.experts.0.w2") == 3,
+          "exl3: a pack without a k-map reads each matrix width from its headers");
   // An f16 router value that is not bf16-exact: the checked load refuses it by name.
   patch_f16(fx.dir, "layers.0.ffn.gate.weight", 5, 0x3C01);  // 1.0009765625: three more mantissa bits than bf16
-  refused = false;
+  bool refused = false;
   try {
     Dsv41LayerStream s(fx.cfg, fx.dir, 0, 1, dgpp::Dsv41Residency::Streaming, dgpp::Dsv41HeadSharding::Full);
     (void)s.load_layer(0);

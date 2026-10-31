@@ -19,12 +19,22 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
+#include "common/dtypes.hpp"
 #include "loaders/minijson.hpp"
 #include "models/glm/moe.hpp"
 
 namespace dgpp {
+
+// Header metadata only. Shapes remain checked against the architecture's
+// binding table; observing a tensor does not make an arbitrary shape valid.
+struct Dsv41TensorDesc {
+  DType dtype{};
+  std::vector<int64_t> shape;
+};
+using Dsv41TensorMap = std::unordered_map<std::string, Dsv41TensorDesc>;
 
 // How a layer's CSA2 attention obtains its main KV, index keys and top-k
 // selection (tech report §2.3.1; plan §1.3).
@@ -134,8 +144,8 @@ struct Dsv41TextConfig {
   // quadruple, the Engram tables from the base checkpoint (the extra shard
   // directory), the routers / weights_proj / Markov head stored F16 and the
   // Engram q/k weights F32. The per-matrix widths come from the pack's
-  // exl3_k_map.json beside config.json (the serving kit's schema), which
-  // the binding table needs to state every trellis shape.
+  // exl3_k_map.json beside config.json (the serving kit's schema), or
+  // per-matrix widths/native dtypes from the published shard headers.
   bool weights_exl3 = false;
   struct Exl3Bits {
     std::vector<int> routed;  // [num_hidden_layers]
@@ -145,6 +155,11 @@ struct Dsv41TextConfig {
     int indexer_wk = 8;
     int head = 6;
     int mtp = 6;              // every matrix under mtp.S.
+    // Packs without a per-layer k-map assign widths per matrix. The
+    // published safetensors headers are authoritative (jayleaton 2.8 bpw).
+    bool per_matrix = false;
+    std::unordered_map<std::string, int> matrix_bits;
+    std::unordered_map<std::string, DType> native_dtypes;
   };
   Exl3Bits exl3;
   // The width of a matrix class at layer l (a draft stage: mtp everywhere).
@@ -158,10 +173,11 @@ struct Dsv41TextConfig {
 
   // Parses config.json's root object. Throws std::runtime_error naming the
   // offending field on anything unsupported. `exl3_k_map`: the parsed
-  // exl3_k_map.json an EXL3 pack ships (required for one, ignored for the
-  // release format).
-  static Dsv41TextConfig parse(const minijson::Value& root, const minijson::Value* exl3_k_map = nullptr);
-  // The file form reads exl3_k_map.json beside an EXL3 pack's config.json.
+  // exl3_k_map.json an EXL3 pack ships, or `exl3_headers` when it has no map.
+  // Both are ignored for the release format.
+  static Dsv41TextConfig parse(const minijson::Value& root, const minijson::Value* exl3_k_map = nullptr,
+                              const Dsv41TensorMap* exl3_headers = nullptr);
+  // The file form reads the optional k-map, otherwise the shard headers.
   static Dsv41TextConfig from_json_file(const std::string& path);
 
   // The deployment's index budget (engine.index_topk, engine.candidate_topk_blocks,

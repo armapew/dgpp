@@ -18,6 +18,8 @@
 #include "loaders/safetensors.hpp"
 #include "models/dsv41/binding.hpp"
 #include "models/dsv41/config.hpp"
+#include "../common/temp_dir.hpp"
+#include "../cuda/dsv41_fixture.hpp"
 
 namespace {
 
@@ -173,4 +175,38 @@ DGPP_TEST(dsv41_binding_matches_the_landed_checkpoint) {
   require(rep.expected == kTotalTensors && rep.matched == kTotalTensors, "every tensor bound");
   require(rep.fp4_matrices == (40 * 384 + 3 * 128) * 3, "fp4 matrices");
   require(rep.engram_tables == 2 && rep.skipped == 266, "tables / vision");
+}
+
+DGPP_TEST(dsv41_mixed_exl3_headers_bind_without_width_map) {
+  dgpp::test::TempDir tmp("dgpp-dsv41-mixed");
+  auto cfg = dsv41fx::tiny_exl3_mixed_config();
+  cfg.exl3.native_dtypes["layers.2.attn.compressor.wkv.weight"] = dgpp::DType::BF16;
+  cfg.exl3.native_dtypes["layers.2.attn.indexer.wk.weight"] = dgpp::DType::BF16;
+  const auto dir = (tmp.path() / "model").string();
+  dsv41fx::write_fixture(cfg, dir);
+  require(!std::filesystem::exists(std::filesystem::path(dir) / "exl3_k_map.json"), "no synthetic k-map");
+  const auto loaded = dgpp::Dsv41TextConfig::from_json_file(dir + "/config.json");
+  require(loaded.exl3.per_matrix, "header-driven widths");
+  require(loaded.exl3.matrix_bits.at("layers.0.ffn.experts.1.w1") == 2 &&
+          loaded.exl3.matrix_bits.at("layers.0.ffn.experts.1.w2") == 3 &&
+          loaded.exl3.matrix_bits.at("layers.0.ffn.experts.5.w2") == 5, "mixed projections retain their widths");
+  require(loaded.exl3.native_dtypes.at("layers.0.ffn.gate.weight") == dgpp::DType::BF16 &&
+          loaded.exl3.native_dtypes.at("layers.0.ffn.gate.bias") == dgpp::DType::F32, "native precisions retained");
+  const auto f = dgpp::SafetensorsFile::open(dir + "/model.safetensors");
+  dgpp::Dsv41TensorMap present;
+  f->for_each([&](const dgpp::TensorInfo& t) { present.emplace(t.name, dgpp::Dsv41TensorDesc{t.dtype, t.shape}); });
+  const auto rep = dgpp::dsv41_validate_text_binding(loaded, present);
+  require(rep.ok() && rep.matched == present.size() && rep.skipped == 2,
+          "all tensors bind; only known duplicate native copies are skipped");
+  for (int r = 0; r < 2; ++r) dgpp::dsv41_tp_validate_geometry(loaded, r, 2);
+
+  // Header-driven width is not permission to accept arbitrary tensor geometry.
+  present.at("layers.0.ffn.experts.1.w2.trellis").shape[0] += 8;
+  require(dgpp::dsv41_validate_text_binding(loaded, present).shape_mismatch == 1, "bad matrix dimensions rejected");
+  auto missing = loaded;
+  missing.exl3.matrix_bits.erase("layers.0.ffn.experts.1.w2");
+  bool refused = false;
+  try { (void)dgpp::dsv41_expected_layer_tensors(missing, 0); }
+  catch (const std::invalid_argument&) { refused = true; }
+  require(refused, "missing width cannot fall back to a uniform default");
 }

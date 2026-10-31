@@ -53,6 +53,10 @@ constexpr uint16_t kExl3Mul1KBias = 0xc931;          // fp16 -10.39
 constexpr float kExl3HadamardScale = 0.088388347648f;  // the reference's fp32 1/sqrt(128)
 
 inline bool exl3_bits_ok(int bits) { return bits >= 1 && bits <= 8; }
+// Native GPU paths compiled for the published 3.5 and mixed 2.8 bpw packs.
+inline bool exl3_gpu_bits_ok(int bits) {
+  return bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
+}
 // Bytes of one 16x16 tile: 256 states x bits / 8.
 inline size_t exl3_tile_bytes(int bits) { return static_cast<size_t>(32) * static_cast<size_t>(bits); }
 

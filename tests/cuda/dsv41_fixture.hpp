@@ -84,10 +84,12 @@ inline const char* tiny_config_json() {
 }
 
 inline Dsv41TextConfig tiny_exl3_config();
+inline Dsv41TextConfig tiny_exl3_mixed_config();
 // The fixture every dsv41 test builds: the fp8 / MXFP4 release stack, or
 // the EXL3 pack (tiny_exl3_config) under DGPP_DSV41_FIXTURE=exl3 — the
 // ctest `_exl3` variants run the same suites on the pack.
 inline Dsv41TextConfig tiny_config() {
+  if (const char* f = std::getenv("DGPP_DSV41_FIXTURE"); f && std::string(f) == "exl3_mixed") return tiny_exl3_mixed_config();
   if (const char* f = std::getenv("DGPP_DSV41_FIXTURE"); f && std::string(f) == "exl3") return tiny_exl3_config();
   const auto t = dgpp::minijson::parse(tiny_config_json());
   return Dsv41TextConfig::parse(t.root);
@@ -148,6 +150,32 @@ inline Dsv41TextConfig tiny_exl3_config() {
   const auto t = dgpp::minijson::parse(tiny_exl3_config_json());
   const auto k = dgpp::minijson::parse(tiny_exl3_kmap_json());
   return Dsv41TextConfig::parse(t.root, &k.root);
+}
+
+inline Dsv41TextConfig tiny_exl3_mixed_config() {
+  auto c = tiny_exl3_config();
+  const auto table = dgpp::dsv41_expected_text_tensors(c);
+  c.exl3.per_matrix = true;
+  constexpr int patterns[7][3] = {{2,2,2}, {2,3,2}, {3,3,3}, {3,4,3}, {4,4,4}, {4,5,4}, {5,5,5}}; // w1,w2,w3
+  for (const auto& e : table) {
+    if (e.role == Dsv41TensorRole::Exl3Trellis) {
+      const auto base = e.name.substr(0, e.name.size() - 8);
+      int bits = 5;
+      if (e.cls == Dsv41WeightClass::RoutedExpert) {
+        const int which = base.back() - '1';
+        bits = patterns[e.expert % 7][which];
+      } else if (e.cls == Dsv41WeightClass::LmHead) bits = 6;
+      else if (e.cls == Dsv41WeightClass::SharedExpert) bits = e.layer % 2 ? 6 : 5;
+      else if (base.ends_with(".indexer.wk")) bits = 8;
+      c.exl3.matrix_bits.emplace(base, bits);
+    } else if (e.role == Dsv41TensorRole::Plain) {
+      auto dtype = e.dtype;
+      if (dtype == dgpp::DType::F16) dtype = e.name.ends_with(".gate.bias") ? dgpp::DType::F32 : dgpp::DType::BF16;
+      if (e.name.ends_with(".engram.q_weight") || e.name.ends_with(".engram.k_weight")) dtype = dgpp::DType::BF16;
+      c.exl3.native_dtypes.emplace(e.name, dtype);
+    }
+  }
+  return c;
 }
 
 inline bool has(const std::string& name, const char* needle) { return name.find(needle) != std::string::npos; }
@@ -255,7 +283,7 @@ inline void write_fixture(const Dsv41TextConfig& cfg, const std::string& dir, co
     std::fwrite(config_json, 1, std::strlen(config_json), f);
     std::fclose(f);
   }
-  if (cfg.weights_exl3) {
+  if (cfg.weights_exl3 && !cfg.exl3.per_matrix) {
     // The pack's k-map beside config.json (from_json_file reads it).
     const fs::path p = root / "exl3_k_map.json";
     std::FILE* f = std::fopen(p.c_str(), "wb");

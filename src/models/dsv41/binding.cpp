@@ -212,6 +212,44 @@ void expect_draft_extras(TensorList& out, const std::string& p, const Dsv41TextC
   }
 }
 
+// Keep architecture-owned shapes, accepting only the format choices present
+// in the mixed-width pack. A missing matrix is an error, never a default bit
+// width. Native dtype variants use checked/exact conversions in the loader.
+void apply_exl3_headers(TensorList& out, const Dsv41TextConfig& cfg) {
+  if (!cfg.weights_exl3 || !cfg.exl3.per_matrix) return;
+  TensorList skipped;
+  for (auto& e : out) {
+    if (e.role == Dsv41TensorRole::Exl3Trellis) {
+      const std::string base = e.name.substr(0, e.name.size() - 8);
+      const auto it = cfg.exl3.matrix_bits.find(base);
+      if (it == cfg.exl3.matrix_bits.end())
+        throw std::invalid_argument("dsv41 binding: EXL3 matrix missing from headers: " + base);
+      e.shape[2] = 16LL * it->second;
+      // The pack also carries unused BF16 copies of these projections.
+      // They must have the correct shape and do not override the EXL3 group.
+      if (base.ends_with(".attn.compressor.wkv") || base.ends_with(".attn.compressor.wgate") ||
+          base.ends_with(".attn.indexer.wk")) {
+        const std::string copy = base + ".weight";
+        if (cfg.exl3.native_dtypes.contains(copy))
+          add(skipped, copy, DType::BF16, {e.shape[1] * 16, e.shape[0] * 16}, e.cls,
+              e.layer, e.expert, Dsv41TensorRole::Skipped);
+      }
+      continue;
+    }
+    const bool native_variant = e.name.ends_with(".ffn.gate.weight") || e.name.ends_with(".ffn.gate.bias") ||
+        e.name.ends_with(".indexer.weights_proj.weight") || e.name.ends_with(".engram.q_weight") ||
+        e.name.ends_with(".engram.k_weight") || e.name.ends_with(".markov_head.head.weight") ||
+        e.name.ends_with(".confidence_head.proj.weight");
+    if (!native_variant) continue;
+    const auto it = cfg.exl3.native_dtypes.find(e.name);
+    if (it == cfg.exl3.native_dtypes.end()) continue;  // the ordinary binding check reports missing tensors
+    if (it->second != DType::BF16 && it->second != DType::F16 && it->second != DType::F32)
+      throw std::invalid_argument("dsv41 binding: unsupported native dtype on " + e.name);
+    e.dtype = it->second;
+  }
+  out.insert(out.end(), std::make_move_iterator(skipped.begin()), std::make_move_iterator(skipped.end()));
+}
+
 }  // namespace
 
 std::string dsv41_layer_prefix(const Dsv41TextConfig& cfg, int layer) {
@@ -232,6 +270,7 @@ std::vector<Dsv41ExpectedTensor> dsv41_expected_layer_tensors(const Dsv41TextCon
   expect_mhc(out, p, cfg, layer);
   expect_attention(out, p + "attn.", cfg, layer);
   expect_moe(out, p + "ffn.", cfg, layer);
+  apply_exl3_headers(out, cfg);
   return out;
 }
 
@@ -244,6 +283,7 @@ std::vector<Dsv41ExpectedTensor> dsv41_expected_global_tensors(const Dsv41TextCo
     add_exl3(out, "head", H, cfg.vocab_size, cfg.exl3.head, Dsv41WeightClass::LmHead, -1);
   else
     add_bf16(out, "head.weight", {cfg.vocab_size, H}, Dsv41WeightClass::LmHead, -1);
+  apply_exl3_headers(out, cfg);
   return out;
 }
 

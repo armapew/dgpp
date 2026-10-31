@@ -496,6 +496,23 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     return dst;
   }
 
+  uint16_t* load_native_bf16(const std::string& name) {
+    switch (expected(name).dtype) {
+      case DType::BF16: return load_bf16(name);
+      case DType::F16: return load_f16_as_bf16_checked(name);
+      case DType::F32: return load_f32_as_bf16_checked(name);
+      default: fail("unsupported native bf16 source: " + name);
+    }
+  }
+  float* load_native_f32(const std::string& name) {
+    switch (expected(name).dtype) {
+      case DType::F32: return load_f32(name);
+      case DType::BF16: return load_bf16_as_f32(name);
+      case DType::F16: return load_f16_as_f32(name);
+      default: fail("unsupported native f32 source: " + name);
+    }
+  }
+
   // ---- the classes ---------------------------------------------------------
   void build_attention(const std::string& p, int layer) {
     Dsv41AttnResident& a = out.attn;
@@ -520,7 +537,7 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
       if (cfg.is_index_source(layer)) {
         const std::string ip = p + "indexer.";
         a.idx_wq_b_x = load_exl3(ip + "wq_b");
-        a.idx_wp = load_f16_as_bf16_checked(ip + "weights_proj.weight");
+        a.idx_wp = load_native_bf16(ip + "weights_proj.weight");
         if (cfg.is_kv_source(layer)) {
           a.idx_wk_x = load_exl3(ip + "wk");
           a.idx_k_norm = load_bf16(ip + "k_norm.weight");
@@ -576,8 +593,8 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
       // expert's parity), the shared expert's by the layer's parity. The
       // resident widths (local_inter) are the widest slice; a matrix's
       // own rows / cols carry its slice.
-      m.router = load_f16_as_bf16_checked(p + "gate.weight");
-      m.router_bias = load_f16_as_f32(p + "gate.bias");
+      m.router = load_native_bf16(p + "gate.weight");
+      m.router_bias = load_native_f32(p + "gate.bias");
       m.experts_x.resize(static_cast<size_t>(E) * 3);
       for (int e = 0; e < E; ++e) {
         const std::string ep = p + "experts." + std::to_string(e) + ".";
@@ -637,8 +654,8 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
                           static_cast<int64_t>(geo.engram_heads_local) * hd);
     if (cfg.weights_exl3) {
       g.wkv_x = load_exl3_col_ranges(p + "wkv", ranges);
-      g.q_weight = load_f32_as_bf16_checked(p + "q_weight");
-      g.k_weight = load_f32_as_bf16_checked(p + "k_weight");
+      g.q_weight = load_native_bf16(p + "q_weight");
+      g.k_weight = load_native_bf16(p + "k_weight");
     } else {
       g.wkv = load_fp8_col_ranges(p + "wkv", ranges);
       g.q_weight = load_bf16(p + "q_weight");
@@ -662,8 +679,8 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
       d.norm = load_bf16(p + "norm.weight");
       d.markov_embed = load_bf16(p + "markov_head.embed.weight");
       if (cfg.weights_exl3) {
-        d.markov_head = load_f16_as_bf16_checked(p + "markov_head.head.weight");
-        d.confidence = load_f16_as_f32(p + "confidence_head.proj.weight");
+        d.markov_head = load_native_bf16(p + "markov_head.head.weight");
+        d.confidence = load_native_f32(p + "confidence_head.proj.weight");
       } else {
         d.markov_head = load_bf16(p + "markov_head.head.weight");
         d.confidence = load_bf16_as_f32(p + "confidence_head.proj.weight");
@@ -782,6 +799,7 @@ void Dsv41LoaderFamily::validate_binding(const Dsv41TextConfig& cfg, const Prese
 // set minus the Engram tables (mapped, never read whole) and the vision
 // tensors (never read).
 bool Dsv41LoaderFamily::digest_included(const Dsv41ExpectedTensor& e) {
+  if (e.skipped()) return false;
   if (e.cls == Dsv41WeightClass::EngramTable || e.cls == Dsv41WeightClass::Vision) return false;
   if (contains(e.name, "gate.bias_vl")) return false;
   return is_replicated(e);

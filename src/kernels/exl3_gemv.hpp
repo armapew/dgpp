@@ -45,7 +45,7 @@
 // tail holds the split form's arrival counters, which must start at zero;
 // every launch leaves them zero; cuBLASLt's workspace is not a home for
 // it) and uses from one stream at a time. Bit widths
-// 3, 4, 6 and 8 are compiled (the pack's). bf16 out rounds the fp32 result
+// 2, 3, 4, 5, 6 and 8 are compiled. bf16 out rounds the fp32 result
 // once; f32 out stores it unrounded (bf16(out_f32) == out_bf16 bit for bit).
 #include <cstddef>
 #include <cstdint>
@@ -115,8 +115,9 @@ void launch_exl3_moe_rotate_slots(const uint16_t* x, size_t x_stride, const int3
 // one-row form's: bitwise the per-slot form (null runs) at any
 // duplication. n_max: the widest gate width among the views (routed or
 // shared); a run's blocks past its own width return. routed_bits /
-// shared_bits: the compiled (routed, shared) pairs 3/6, 4/6, 6/6, 3/3,
-// 4/4, 8/8, 4/8.
+// shared_bits: uniform widths, or 0 for a heterogeneous routed table.
+// Common pairs retain their specialized forms; the other supported pairs
+// dispatch uniformly within each CTA from the selected expert's own view.
 void launch_exl3_moe_slot_gate_up_swiglu(const uint16_t* xh_g, const uint16_t* xh_u, size_t xh_stride,
                                          const int32_t* ids, const int32_t* order, const int32_t* runs,
                                          const MoeExpertView* views, int n_max, int k, int routed_bits,

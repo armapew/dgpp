@@ -92,11 +92,6 @@ std::vector<Dsv41ExpectedTensor> dsv41_expected_global_tensors(const Dsv41TextCo
 // The vision tower's tensors (present-and-skipped); empty without a vision_config.
 std::vector<Dsv41ExpectedTensor> dsv41_expected_vision_tensors(const Dsv41TextConfig& cfg);
 
-struct Dsv41TensorDesc {
-  DType dtype{};
-  std::vector<int64_t> shape;
-};
-
 struct Dsv41BindReport {
   size_t expected = 0;
   size_t matched = 0;
