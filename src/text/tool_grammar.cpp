@@ -965,6 +965,26 @@ void GrammarState::mask(TokenMask* out) const {
       free_mask(out, /*extra_allowed=*/-1, /*forbid_markers=*/false);
       return;
     case State::kTop: {
+      if (dsml() && obligation_open() &&
+          (spec_.mode == GrammarSpec::Mode::kRequired || spec_.mode == GrammarSpec::Mode::kNamed)) {
+        if (top_lt_) {
+          list_mask(out, {m.dsml.id});
+        } else {
+          // DSML's opener spans ordinary BPE text and a special tag.
+          // Force the text half now, allowing merged whitespace + '<'
+          // tokens but no whitespace-only/prose loop while a call is owed.
+          std::vector<int64_t> ids;
+          for (const unsigned char first : {'<', ' ', '\n', '\r', '\t'})
+            for (const int32_t id : vocab_->ids_starting_with(first)) {
+              const std::string& text = vocab_->text(id);
+              size_t i = 0;
+              while (i < text.size() && JsonLexer::is_ws(static_cast<uint8_t>(text[i]))) ++i;
+              if (i + 1 == text.size() && text[i] == '<') ids.push_back(id);
+            }
+          list_mask(out, ids);
+        }
+        return;
+      }
       if (spec_.mode == GrammarSpec::Mode::kJsonOrTools) {
         if (dsml() && top_lt_) {
           list_mask(out, {m.dsml.id});
@@ -1008,8 +1028,8 @@ void GrammarState::mask(TokenMask* out) const {
       // until max_tokens without ever taking the low-probability
       // <tool_call> — the TC-45 probe ("reply OK, do not call tools" with
       // tool_choice required) then sees no tool call and reports the
-      // endpoint as not enforcing required. DSML keeps the free top: its
-      // opener is ordinary text ("<" + tag), not forceable by a token mask.
+      // endpoint as not enforcing required. DSML's owed-call case above
+      // likewise forces its two-part opener; its other top states stay free.
       // MiMo's compact dialect keeps it too: its template leaves the
       // opening to the model (it opens <think> itself), pinned by
       // tool_grammar_mimo_modelOpensThinkingAndStraddledTerminator.

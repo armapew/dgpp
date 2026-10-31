@@ -501,6 +501,7 @@ constexpr int64_t kQuotedLt = 265;
 // The V4 vocabulary's id that spans an invoke header's end and the blank
 // line of a call without parameters (the real tokenizer has one).
 constexpr int64_t kHeadEndBlank = 266;
+constexpr int64_t kSpacedLt = 267, kBlankLines = 268, kProseLt = 269;
 GrammarVocab dsml_vocab(dgpp::text::DsmlDialect dialect = dgpp::text::DsmlDialect::kV41) {
   std::vector<std::string> texts(static_cast<size_t>(kVocab));
   for (int b = 0; b < 256; ++b) texts[static_cast<size_t>(b)] = std::string(1, static_cast<char>(b));
@@ -516,6 +517,9 @@ GrammarVocab dsml_vocab(dgpp::text::DsmlDialect dialect = dgpp::text::DsmlDialec
   texts[kThinkOpen] = "<think>";
   texts[kThinkClose] = "</think>";
   texts[kQuotedLt] = "\"x<";
+  texts[kSpacedLt] = "\n\n<";
+  texts[kBlankLines] = "\n\n";
+  texts[kProseLt] = "OK<";
   if (dialect == dgpp::text::DsmlDialect::kV4) texts[kHeadEndBlank] = "\">\n\n";
   ChatMarkers m;
   m.think_open = ChatMarker{kThinkOpen, "<think>"};
@@ -530,16 +534,9 @@ DGPP_TEST(tool_grammar_dsml_required_call_walks_the_tagged_shape) {
   require(vocab.usable() && vocab.markers().tool_format() == dgpp::text::ToolFormat::kDsml,
           "the tag-token vocabulary is the DSML format");
   GrammarState g(&vocab, spec_of(GrammarSpec::Mode::kRequired), /*prompt_opens_thinking=*/false);
-  // The top is free text (the content before the block); the tag needs
-  // its "<"; the turn may not end while the call is owed.
-  require(g.allows('H') && !g.allows(kDsmlTag) && !g.allows(kEosText), "top: text, no bare tag, no EOS while owed");
-  feed(g, bytes_of("Sure.\n\n"));
-  require(!g.allows(kDsmlTag), "the tag is not offered until a '<'");
+  require(same(allowed_ids(g), {'<', kSpacedLt}), "required forces an opener, including merged BPE whitespace");
   g.advance('<');
-  require(g.allows(kDsmlTag) && g.allows('a'), "after '<': the tag (or more text)");
-  g.advance('a');
-  require(!g.allows(kDsmlTag), "text after the '<' withdraws the tag");
-  feed(g, bytes_of(" <"));
+  require(same(allowed_ids(g), {kDsmlTag}), "after '<': only the tag, no prose escape");
   g.advance(kDsmlTag);
   require(std::string(g.state_name()) == "d-calls", std::string("after the tag: ") + g.state_name());
   require(same(allowed_ids(g), {' '}), "the block opens with ' calls>': " + show(allowed_ids(g)));
@@ -613,6 +610,31 @@ DGPP_TEST(tool_grammar_dsml_required_call_walks_the_tagged_shape) {
   require(same(allowed_ids(g), {kEosText}), "after the block: EOS only: " + show(allowed_ids(g)));
   g.advance(kEosText);
   require(std::string(g.state_name()) == "done", "done after EOS");
+}
+
+DGPP_TEST(tool_grammar_dsml_required_and_named_leave_thinking_free_then_force_the_opener) {
+  for (const auto dialect : {dgpp::text::DsmlDialect::kV41, dgpp::text::DsmlDialect::kV4}) {
+    const GrammarVocab vocab = dsml_vocab(dialect);
+    for (const auto mode : {GrammarSpec::Mode::kRequired, GrammarSpec::Mode::kNamed}) {
+      GrammarState g(&vocab, spec_of(mode, false, mode == GrammarSpec::Mode::kNamed ? "ping" : ""), true);
+      feed(g, bytes_of("OK. Do not call any tools."));
+      require(!g.allows(kEosText), "reasoning stays free but cannot end an owed-call turn");
+      g.advance(kThinkClose);
+      require(same(allowed_ids(g), {'<', kSpacedLt}), "reasoning closes into the forced opener, not prose/whitespace");
+      g.advance(kSpacedLt);
+      require(same(allowed_ids(g), {kDsmlTag}), "merged whitespace opener requires the special tag next");
+      g.advance(kDsmlTag);
+      require(std::string(g.state_name()) == "d-calls", "both dialects enter their calls literal");
+    }
+    GrammarState automatic(&vocab, spec_of(GrammarSpec::Mode::kAuto), false);
+    feed(automatic, bytes_of("Sure.\n\n<"));
+    require(automatic.allows(kDsmlTag) && automatic.allows('a'), "auto still permits prose or a tool block");
+    automatic.advance('a');
+    require(!automatic.allows(kDsmlTag), "auto prose after '<' withdraws the tag");
+    GrammarState forbidden(&vocab, spec_of(GrammarSpec::Mode::kForbidCalls), false);
+    feed(forbidden, bytes_of("OK<"));
+    require(!forbidden.allows(kDsmlTag) && forbidden.allows(kEosText), "none still permits plain completion only");
+  }
 }
 
 DGPP_TEST(tool_grammar_dsml_typed_values_named_single_and_open_keys) {
@@ -715,8 +737,8 @@ DGPP_TEST(tool_grammar_dsml_v4_dialect_walks_its_own_spelling) {
               vocab.markers().dsml_dialect == dgpp::text::DsmlDialect::kV4,
           "the tag-token vocabulary in the V4 dialect");
   GrammarState g(&vocab, spec_of(GrammarSpec::Mode::kRequired), /*prompt_opens_thinking=*/false);
-  require(g.allows('H') && !g.allows(kDsmlTag) && !g.allows(kEosText), "top: text, no bare tag, no EOS while owed");
-  feed(g, bytes_of("Sure.\n\n<"));
+  require(same(allowed_ids(g), {'<', kSpacedLt}), "V4 required forces the text half of its opener too");
+  g.advance(kSpacedLt);
   g.advance(kDsmlTag);
   require(std::string(g.state_name()) == "d-calls", std::string("after the tag: ") + g.state_name());
   require(same(allowed_ids(g), {'t'}), "the block opens with 'tool_calls>', no space: " + show(allowed_ids(g)));

@@ -22,6 +22,7 @@ char** g_argv = nullptr;
 #include "loaders/minijson.hpp"
 #include "text/dsv41_prompt.hpp"
 #include "text/tokenizer.hpp"
+#include "text/tool_grammar.hpp"
 #include "serve/frontend.hpp"
 
 namespace {
@@ -80,6 +81,46 @@ DGPP_TEST(dsv41_prompt_differential_goldens) {
   const dgpp::text::Tokenizer tok =
       dgpp::text::Tokenizer::load((std::filesystem::path(snap) / "tokenizer.json").string());
   const dgpp::serve::Dsv41Frontend frontend(&tok);
+  require(frontend.uses_response_format_prompt(), "DeepSeek opts in to native schema prompting");
+  // Exercise required/named with the checkpoint's actual BPE vocabulary,
+  // including the ordinary '<' token followed by the special DSML token.
+  const auto eos = tok.encode(dgpp::text::Dsv41Prompt::kEos);
+  require(eos.size() == 1, "the reference tokenizer has one EOS marker");
+  const auto vocab = dgpp::text::GrammarVocab::from_tokenizer(tok, eos, static_cast<int>(tok.max_id() + 1));
+  const auto ping = dgpp::minijson::parse(R"({"name":"probe_ping","strict":true,"parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false}})");
+  for (const auto mode : {dgpp::text::GrammarSpec::Mode::kRequired, dgpp::text::GrammarSpec::Mode::kNamed}) {
+    dgpp::text::GrammarSpec spec;
+    spec.mode = mode;
+    spec.parallel = false;
+    if (mode == dgpp::text::GrammarSpec::Mode::kNamed) spec.named = "probe_ping";
+    spec.tools.push_back(dgpp::text::grammar_tool_from_function(ping.root, nullptr));
+    dgpp::text::GrammarState grammar(&vocab, spec, true);
+    for (const auto id : tok.encode("OK. Do not call any tools.</think>")) {
+      require(grammar.allows(id), "reasoning is unconstrained until its close marker");
+      grammar.advance(id);
+    }
+    dgpp::text::TokenMask mask;
+    grammar.mask(&mask);
+    int openers = 0;
+    for (int64_t id = 0; id <= tok.max_id(); ++id) {
+      if (!mask.allows(id)) continue;
+      const std::string text = tok.decode(id);
+      const auto first = text.find_first_not_of(" \t\r\n");
+      require(first != std::string::npos && first + 1 == text.size() && text[first] == '<',
+              "every allowed BPE token opens DSML, never prose or whitespace alone");
+      ++openers;
+    }
+    require(openers > 0, "real BPE vocabulary can express a forced opener");
+    const std::string call = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"probe_ping\">\n"
+        "<｜DSML｜ parameter name=\"value\" string=\"true\">OK</｜DSML｜ parameter>\n"
+        "</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>";
+    for (const auto id : tok.encode(call)) {
+      require(grammar.allows(id), "real tokenizer accepts the complete required/named DSML call at " +
+                  std::string(grammar.state_name()));
+      grammar.advance(id);
+    }
+    require(std::string(grammar.state_name()) == "done", "call satisfies the obligation and ends cleanly");
+  }
   for (const auto& [effort, budget] : std::vector<std::pair<std::string,int>>{
       {"minimal",25},{"low",50},{"medium",62},{"high",75},{"xhigh",100},{"max",100}}) {
     const auto settings = frontend.reasoning_settings(effort);
