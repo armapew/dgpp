@@ -41,6 +41,7 @@ struct Msg {
   bool has_reasoning = false;
   std::vector<ToolCall> calls;
   const minijson::Value* tools = nullptr;  // the system message's tools
+  const minijson::Value* response_format = nullptr;  // normalized schema
 };
 
 std::string json_of(const minijson::Value& v) { return Value::from_minijson(v).to_json(/*ensure_ascii=*/false); }
@@ -309,7 +310,7 @@ bool Dsv41Prompt::reads(std::string_view name) {
          name == "reasoning_effort";
 }
 
-uint64_t Dsv41Prompt::source_hash() { return 0x64737634312d3031ull; }  // "dsv41-01": the renderer's first revision
+uint64_t Dsv41Prompt::source_hash() { return 0x64737634312d3032ull; }  // "dsv41-02": native response-format block
 
 std::string Dsv41Prompt::render(const minijson::Value& globals) {
   if (!globals.is_object()) refuse("globals must be an object");
@@ -318,6 +319,10 @@ std::string Dsv41Prompt::render(const minijson::Value& globals) {
   const minijson::Value* tools = globals.find("tools");
   if (tools && (tools->is_null() || (tools->is_array() && tools->items().empty()))) tools = nullptr;
   if (tools && !tools->is_array()) refuse("tools must be an array");
+  const minijson::Value* response_format = globals.find("response_format");
+  if (response_format && response_format->is_null()) response_format = nullptr;
+  if (response_format && !response_format->is_object()) refuse("response_format must be a schema object");
+  if (response_format && response_format->members().empty()) response_format = nullptr;
   bool thinking = true, drop_thinking = true;
   if (const minijson::Value* v = globals.find("enable_thinking"); v && v->is_bool()) thinking = v->as_bool();
   if (const minijson::Value* v = globals.find("thinking"); v && v->is_bool()) thinking = v->as_bool();
@@ -364,16 +369,16 @@ std::string Dsv41Prompt::render(const minijson::Value& globals) {
     }
     raw.push_back(std::move(msg));
   }
-  // The tools ride the first system message, or an empty one in front.
-  if (tools) {
-    if (raw[0].role == "system") {
-      raw[0].tools = tools;
-    } else {
+  // Tools and the schema ride the first system message, or an empty one
+  // in front, in the reference encoder's order (tools before schema).
+  if (tools || response_format) {
+    if (raw[0].role != "system") {
       Msg sys;
       sys.role = "system";
-      sys.tools = tools;
       raw.insert(raw.begin(), std::move(sys));
     }
+    raw[0].tools = tools;
+    raw[0].response_format = response_format;
   }
 
   // ---- merge_tool_messages ------------------------------------------------------
@@ -466,6 +471,9 @@ std::string Dsv41Prompt::render(const minijson::Value& globals) {
       if (index > 0) out += kSystem;
       out += m.content;
       if (m.tools) out += "\n\n" + render_tools(*m.tools);
+      if (m.response_format)
+        out += "\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n" +
+               json_of(*m.response_format);
     } else if (m.role == "user") {
       out += kUser;
       bool first = true;

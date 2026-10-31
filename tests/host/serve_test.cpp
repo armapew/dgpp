@@ -51,6 +51,7 @@
 #include "text/chat_template.hpp"
 #include "text/dsv41_prompt.hpp"
 #include "text/dsv4_prompt.hpp"
+#include "text/json_grammar.hpp"
 
 namespace {
 
@@ -443,6 +444,8 @@ std::string json_of(const dgpp::minijson::Value& v) {
 // the same rule. It keeps the last globals the service handed it.
 class FakeFrontend : public ModelFrontend {
  public:
+  bool schema_prompt = false;
+  bool uses_response_format_prompt() const override { return schema_prompt; }
   std::function<void(std::string_view)> encode_hook;
   std::function<std::string(const dgpp::minijson::Value&)> render_hook;
   mutable std::atomic<size_t> decoded_ids{0};
@@ -3496,6 +3499,43 @@ DGPP_TEST(serve_responseFormat_armsTheJsonGrammar) {
                 std::string::npos,
             "models report the absence");
   }
+}
+
+DGPP_TEST(serve_responseFormat_nativePromptGetsValidatedSchema) {
+  using Mode = dgpp::text::GrammarSpec::Mode;
+  ServiceRig rig(/*queue_limit=*/8, model_defaults(), /*can_sample=*/true,
+                 std::nullopt, /*with_markers=*/true);
+  rig.frontend.schema_prompt = true;
+  const auto check = [&](const std::string& format, const std::string& choice,
+                         const std::string& expected, Mode mode) {
+    const std::string response = post_until_usage(rig, chat_body("abcd", 8, kWeatherTools + format + choice));
+    require(response.find("200 ") != std::string::npos, "accepted native format: " + response);
+    const auto globals = dgpp::minijson::parse(rig.frontend.last_globals());
+    const auto* schema = globals.root.find("response_format");
+    require(schema && dgpp::text::json_text_of(*schema) == expected,
+            "only the normalized schema reaches the native renderer: " + rig.frontend.last_globals());
+    require(rig.engine.grammars().back().mode == mode, "native prompting preserves grammar/tool choice");
+  };
+  check(R"(,"response_format":{"type":"json_object"})", "",
+        R"({"type": "object"})", Mode::kJsonOrTools);
+  const std::string format = R"(,"response_format":{"type":"json_schema","json_schema":{"name":"score","strict":true,"schema":{"type":"integer"}}})";
+  check(format, "", R"({"type": "integer"})", Mode::kJsonOrTools);
+  check(format, R"(,"tool_choice":"none")", R"({"type": "integer"})", Mode::kJson);
+  check(format, R"(,"tool_choice":"required")", R"({"type": "integer"})", Mode::kRequired);
+  check(format, R"(,"tool_choice":{"type":"function","function":{"name":"get_weather"}})",
+        R"({"type": "integer"})", Mode::kNamed);
+  check(R"(,"response_format":{"type":"json_schema","json_schema":{"name":"p","schema":{"type":"string","maxLength":3}}})",
+        "", R"({"type": "string", "maxLength": 3})", Mode::kJsonOrTools);
+  require(rig.engine.grammars().back().json_schema.empty(), "non-strict fallback still keeps the prompt schema");
+  for (const std::string& extra : {std::string(), std::string(R"(,"response_format":{"type":"text"})"),
+         std::string(R"(,"response_format":{"type":"json_schema","json_schema":{"name":"p"}})")}) {
+    (void)post_until_usage(rig, chat_body("abcd", 8, extra));
+    require(dgpp::minijson::parse(rig.frontend.last_globals()).root.find("response_format") == nullptr,
+            "absent/text/missing schema does not invent a native format");
+  }
+  const std::string overridden = post_chat(rig, chat_body("abcd", 8, format +
+      R"(,"chat_template_kwargs":{"response_format":{"type":"string"}})"));
+  require(overridden.find("400 ") != std::string::npos, "template kwargs cannot override the validated API schema");
 }
 
 DGPP_TEST(serve_shutdown_drainsInFlightWorkWithTheShutdownError) {

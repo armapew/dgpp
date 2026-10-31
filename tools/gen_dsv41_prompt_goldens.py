@@ -10,8 +10,8 @@ tool_call_id), optional "tools" (the OpenAI array), "reasoning_effort"
 (the service's strings), "clear_thinking" and "enable_thinking". The
 mapping from the globals to the reference's call is the renderer's
 contract, written here once:
-  * tools attach to the first system message ("tools" field), or to an
-    empty system message inserted at the front;
+  * tools and response_format (the normalized schema) attach to the first
+    system message, or to an empty system message inserted at the front;
   * enable_thinking false -> thinking_mode "chat", else "thinking";
   * clear_thinking -> drop_thinking (default true);
   * reasoning_effort: minimal 25, low 50, medium 62, high 75, max 100 (the
@@ -139,17 +139,32 @@ CASES = [
     ("empty_content", {"messages": [{"role": "user", "content": ""}]}),
     ("unicode_and_code", {"messages": [{"role": "system", "content": "Répondez en français, s'il vous plaît."},
                                        {"role": "user", "content": "def add(a, b):\n    return a + b  # 注释\n"}]}),
+    ("format_no_system", {"messages": [{"role": "user", "content": "Answer in JSON."}],
+                          "response_format": {"type": "object"}, "reasoning_effort": "xhigh"}),
+    ("format_with_tools", {"messages": [{"role": "system", "content": "Use tools when needed."},
+                                        {"role": "user", "content": "Weather in Paris?"}],
+                           "tools": [weather_tool()], "response_format": {
+                               "type": "object", "properties": {"city": {"type": "string", "description": "城市"}},
+                               "required": ["city"], "additionalProperties": False}}),
+    ("format_mid_system_chat", {"messages": [{"role": "user", "content": "One"},
+                                             {"role": "assistant", "content": "Two"},
+                                             {"role": "system", "content": "Now use JSON."}],
+                                "response_format": {"type": "object"}, "enable_thinking": False}),
+    ("format_empty_schema", {"messages": [{"role": "user", "content": "Hi"}], "response_format": {}}),
 ]
 
 
 def to_reference(kwargs):
     messages = copy.deepcopy(kwargs["messages"])
     tools = kwargs.get("tools")
-    if tools:
-        if messages and messages[0].get("role") == "system":
+    schema = kwargs.get("response_format")
+    if tools or schema:
+        if messages[0].get("role") != "system":
+            messages.insert(0, {"role": "system", "content": ""})
+        if tools:
             messages[0]["tools"] = tools
-        else:
-            messages.insert(0, {"role": "system", "content": "", "tools": tools})
+        if schema:
+            messages[0]["response_format"] = schema
     thinking_mode = "chat" if kwargs.get("enable_thinking") is False else "thinking"
     drop = kwargs.get("clear_thinking", True)
     effort = kwargs.get("reasoning_effort")
@@ -163,7 +178,11 @@ def main():
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--snapshot", default=None)
     ap.add_argument("--out", default="tests/data/dsv41_prompt_goldens.jsonl")
+    ap.add_argument("--case-prefix", default="", help="Generate only cases with this name prefix")
     args = ap.parse_args()
+    cases = [(name, kwargs) for name, kwargs in CASES if name.startswith(args.case_prefix)]
+    if not cases:
+        ap.error("no cases match --case-prefix")
     snap = Path(args.snapshot) if args.snapshot else cached_snapshot(args.model, cache_root(cache_environment()))
     enc_path = snap / "encoding" / "encoding.py"
     spec = importlib.util.spec_from_file_location("dsv41_encoding", enc_path)
@@ -177,16 +196,16 @@ def main():
         "encoder_hash": f"{fnv1a64(enc_path.read_bytes()):016x}",
         "tokenizer_revision": f"{fnv1a64(tok_path.read_bytes()):016x}",
         "tokenizers": tokenizers.__version__,
-        "cases": len(CASES),
+        "cases": len(cases),
     }
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(json.dumps(header) + "\n")
-        for name, kwargs in CASES:
+        for name, kwargs in cases:
             messages, mode, drop, effort = to_reference(kwargs)
             render = enc.encode_messages(messages, thinking_mode=mode, drop_thinking=drop, reasoning_effort=effort)
             ids = tok.encode(render, add_special_tokens=False).ids
             f.write(json.dumps({"name": name, "kwargs": kwargs, "render": render, "ids": ids}, ensure_ascii=False) + "\n")
-    print(f"wrote {args.out}: {len(CASES)} cases (encoder {header['encoder_hash']}, tokenizer {header['tokenizer_revision']})")
+    print(f"wrote {args.out}: {len(cases)} cases (encoder {header['encoder_hash']}, tokenizer {header['tokenizer_revision']})")
 
 
 if __name__ == "__main__":

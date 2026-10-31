@@ -1105,6 +1105,9 @@ dgpp_set_common(dsv41_prompt_test)
 add_test(NAME dsv41_prompt_test
   COMMAND dsv41_prompt_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/dsv41_prompt_goldens.jsonl)
 set_tests_properties(dsv41_prompt_test PROPERTIES SKIP_RETURN_CODE 2)
+add_test(NAME dsv41_response_format_test
+  COMMAND dsv41_prompt_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/dsv41_response_format_goldens.jsonl)
+set_tests_properties(dsv41_response_format_test PROPERTIES SKIP_RETURN_CODE 2)
 # The EXL3 trellis host codec (models/exl3_matrix.hpp) against the numpy
 # reference's pins on the LibertAIDAI DeepSeek-V4.1-Flash-1017 pack
 # (docs/deepseek_v41_flash_exl3_plan.md §2.4). CUDA-free.

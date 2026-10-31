@@ -1430,8 +1430,9 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
   // ---- response_format (M6 6h) -------------------------------------------
   // json_object and json_schema are guarantees of the same masked pick: the
   // content is one JSON text (an object in json_object mode; conforming to
-  // the schema in json_schema mode), then the turn ends. The prompt is
-  // untouched; the model reasons first when the template opens thinking.
+  // the schema in json_schema mode), then the turn ends. Native encoders
+  // that opt in also receive the schema in their prompt; thinking stays free.
+  std::optional<Value> response_schema;
   if (const Value* rf = body.find("response_format")) {
     if (!rf->is_object())
       return refuse("response_format must be an object", "response_format");
@@ -1451,6 +1452,8 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
             "response_format", "constrained_decoding_unsupported");
       using dgpp::text::GrammarSpec;
       GrammarSpec& g = plan->grammar;
+      if (kind == "json_object")
+        response_schema = Value::make_object({Member{"type", Value::make_owned_string("object")}});
       // A required/named choice still owes a tool call. Auto can choose
       // either a call or the structured answer; none forces the answer.
       if (!have_tools || choice == Choice::kNone)
@@ -1478,6 +1481,9 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
                         "(a JSON schema)",
                         "response_format.json_schema.schema");
         if (schema != nullptr) {
+          // Preserve the requested schema for native prompting even when
+          // non-strict constrained decoding must fall back to free JSON.
+          response_schema = *schema;
           // Compile here to refuse loudly: the subset is type, properties,
           // required, additionalProperties, items, minItems, maxItems,
           // enum, const, anyOf. strict: anything outside it is a 400 naming
@@ -1879,6 +1885,8 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
   // ---- the template globals ----------------------------------------------
   std::vector<Member> globals;
   globals.push_back(Member{"messages", Value::make_array(std::move(msgs))});
+  if (response_schema && frontend_->uses_response_format_prompt())
+    globals.push_back(Member{"response_format", std::move(*response_schema)});
   if (have_tools && choice != Choice::kNone) {
     // Keep function fields in their original wrapped or flat shape, plus
     // DeepSeek-V4.1 namespaces so rendered names agree with the tool grammar.

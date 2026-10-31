@@ -109,6 +109,7 @@ class Dsv41Frontend : public ModelFrontend {
     return tok_->decode(ids, /*skip_special_tokens=*/true);
   }
   bool template_reads(std::string_view name) const override { return dgpp::text::Dsv41Prompt::reads(name); }
+  bool uses_response_format_prompt() const override { return true; }
   std::string render_chat(const minijson::Value& globals) const override {
     return dgpp::text::Dsv41Prompt::render(globals);
   }

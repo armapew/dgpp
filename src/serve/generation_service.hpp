@@ -133,6 +133,10 @@ class ModelFrontend {
     std::vector<ImageInput> images;
   };
   virtual bool supports_images() const { return false; }
+  // Native encoders may also teach the model the requested output schema.
+  // Opt in explicitly: `response_format` is the validated schema object,
+  // not the API envelope or an arbitrary chat_template_kwargs override.
+  virtual bool uses_response_format_prompt() const { return false; }
   virtual ChatInput prepare_chat(const minijson::Value& globals) const {
     return {encode_text(render_chat(globals)), {}};
   }
