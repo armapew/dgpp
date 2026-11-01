@@ -1,5 +1,13 @@
 # DGPP
 
+This branch preserves the operator-accepted **DeepSeek-V4.1-Flash-1017 EXL3
+2.8 bpw text baseline on two DGX Sparks**, dated 2026-11-01. The exact engine
+is tagged `spark-deepseek-q28-text-2026.11.01`; its configuration, validation
+and remaining limitations are in the
+[2.8 bpw model card](docs/model_cards/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw.md#accepted-text-baseline).
+DeepSeek vision and Responses/client integration remain separate future work.
+The upstream overview below covers other models and profiles as well.
+
 [![CI](https://github.com/HawkBearPig/dgpp/actions/workflows/ci.yml/badge.svg)](https://github.com/HawkBearPig/dgpp/actions/workflows/ci.yml)
 [![GB10 build](https://github.com/HawkBearPig/dgpp/actions/workflows/gb10-build.yml/badge.svg)](https://github.com/HawkBearPig/dgpp/actions/workflows/gb10-build.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)

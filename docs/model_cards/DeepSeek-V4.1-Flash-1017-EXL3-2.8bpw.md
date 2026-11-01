@@ -1,10 +1,11 @@
-# DeepSeek-V4.1-Flash-1017 EXL3 2.8 bpw candidate
+# DeepSeek-V4.1-Flash-1017 EXL3 2.8 bpw two-Spark text baseline
 
-This candidate targets
+This baseline targets
 [`jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw)
 at revision `859396591c340195526aaf61f94b4ad5323a5e18` on two GB10 nodes.
-The initial scope is text inference. DeepSeek vision and Responses/client
-integration are deferred until the text baseline has been evaluated.
+The operator accepted this text baseline on 2026-11-01 after the full
+evaluation recorded below. DeepSeek vision, Responses/client integration and
+further performance changes remain separate future work.
 
 ## Weight contract
 
@@ -95,10 +96,10 @@ stayed at zero swap. The two ranks' operation streams matched byte-for-byte
 at clean shutdown. Restarting from all 43 resident-image layers reproduced the
 same greedy message, and strict JSON-schema output passed after restart.
 
-These are bounded correctness and deployment checks, not a full quality or
-performance campaign. Quality above roughly 100K context, maximum-pool C4,
-vision and Responses/client integration remain unvalidated. The operator's
-full text evaluation is the next acceptance gate.
+These initial checks are bounded correctness and deployment checks, not a full
+quality or performance campaign. Quality above roughly 100K context,
+maximum-pool C4, vision and Responses/client integration remain unvalidated.
+The subsequent operator-run text evaluations are recorded below.
 
 ## Serving-contract corrections
 
@@ -138,15 +139,16 @@ The subsequent serving/profile changes are recorded below.
 ## Raw JSON and adaptive verification
 
 Build `3b3f4bc497f3` makes the raw-JSON contract explicit in system content
-whenever a response schema is requested. This avoids the reproduced fence/tool
-conflict without weakening the grammar, adding output rewriting or changing
-ordinary chat prompts. The renderer revision is bumped; 20 original and four
+whenever a response schema is requested. This resolves the reproduced cold
+fence/tool check without weakening the grammar, adding output rewriting or
+changing ordinary chat prompts; the later full run still has a TC-67 partial.
+The renderer revision is bumped; 20 original and four
 schema prompt fixtures match the reference encoder with that API instruction.
 
 The operator's evaluator subset, unchanged at T0/seed 42/xhigh/C3, passes
 TC-45/64/65/66/67/69; TC-68 remains partial for an unnecessary search. The
 required-tool capability probe succeeds in 40 tokens with valid arguments.
-The full benchmark is still the operator's acceptance gate for this build.
+The full benchmark below records the broader outcome on this build.
 
 The selected confidence schedule reproduced four baseline capped greedy
 transcripts exactly in C1/C3 checks. C2 and C4 mixed-temperature checks,
@@ -161,3 +163,54 @@ A rank-0 prefill profile remains dominated by EXL3, attention and collective
 work. An idle 4K chunk trial showed only a small one-pass gain; the selected
 profile retains 2K busy/idle caps. No kernel arithmetic, quantization, expert
 routing, KV precision, model weights or sampling defaults changed.
+
+## Accepted text baseline
+
+The operator accepted this version as the stable text baseline on 2026-11-01.
+The preserved branch is
+`baseline/deepseek-v4.1-flash-1017-2.8bpw-tp2-20261101` in `armapew/dgpp`.
+It contains the complete implementation, portable deployment template and
+validation notes. Future work should branch from this baseline; retain the
+existing `spark` lineage separately.
+
+| Reproduction identity | Value |
+| --- | --- |
+| Upstream base | `92303ef9ddcdd67ae9acb4e8e199f5c6219b3d14` |
+| Exact engine commit | `3b3f4bc497f3cc1540bbe9909412a4d74bc8037f` |
+| Immutable engine tag | `spark-deepseek-q28-text-2026.11.01` |
+| Installed release | `0.1.0+g3b3f4bc497f3` |
+| Binary SHA256, both ranks | `0f247418037cc1b1a9fa92a7ff424bf83fcece4dd5e32ff2a8bb63fc21a6db83` |
+| Release package SHA256 | `6338a6df4538ba6a742f584ad2cc041399e157e3d06e4ebca95059071ee406ee` |
+
+The branch includes later documentation commits. Rebuild the engine tag above
+to reproduce the tested implementation. Site credentials, local deployment
+addresses, model weights and binary packages are not part of this public
+source branch. The operator retains the exact package, source bundle,
+deployment JSON, private environment, launch defaults and checksum manifest
+in the deployment's recovery set. Restore the matching JSON and environment
+together with the release; preserve the authenticated proxy and loopback-only
+backend.
+
+The operator's full quality run
+`2026-10-31T23-46-01.768852Z_d262f59c` scored **201/208 (97/100): 98 passes,
+five partials and one failure**, with all 104 scenarios scored and no
+infrastructure exclusions. The evaluator was unmodified
+`tool-eval-bench 3.0.1.dev7+g887b53757`, at temperature zero, seed 42, xhigh,
+parallelism three and `max_tokens=65536`. The engine retained C4 admission,
+the 1M shared pool, 2K prefill caps and adaptive depths 1/3/5 described above.
+
+The two-point gain over the preceding 199/208 run came from TC-104 passing.
+TC-57/60/63/67/68 remained partial, and TC-92 still failed tenant isolation.
+TC-67's focused pass did not generalize to the full concurrent run; it again
+called an unnecessary calculator despite schema-valid final JSON. Preserve
+that case in future concurrency checks. This acceptance freezes a known
+working baseline with these limitations; it does not establish universal
+quality parity or resolve every reasoning failure.
+
+The exact release also passed the focused retrieval, sampled concurrency,
+streaming, cancellation and restart checks above. Available memory during
+those checks stayed above 8.84 GiB on the head and 8.74 GiB on the peer, with
+both serving processes at zero swap. These measurements cover bounded
+20K/100K and C4 traffic, not four maximum-context requests or future vision.
+No new throughput campaign is claimed by this preservation step. Performance
+parity with the retained TensorFold deployment remains unestablished.
